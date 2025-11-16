@@ -16,10 +16,12 @@ from flask_cors import CORS
 from dataclasses import dataclass
 from urllib.parse import quote_plus
 
+from flask import Response
+
 # -------------------- CONFIG --------------------
 @dataclass
 class Config:
-    UNSPLASH_ACCESS_KEY: str = ""  # Optional
+    UNSPLASH_ACCESS_KEY: str = os.getenv("UNSPLASH_ACCESS_KEY", "")
     CACHE_TTL: int = int(os.getenv("CACHE_TTL", "3600"))
     MAX_IMAGE_WORKERS: int = int(os.getenv("MAX_IMAGE_WORKERS", "8"))
     REQUEST_TIMEOUT: int = int(os.getenv("REQUEST_TIMEOUT", "10"))
@@ -27,9 +29,9 @@ class Config:
     FLASK_PORT: int = int(os.getenv("FLASK_PORT", "5000"))
     MAPBOX_ACCESS_TOKEN: str = os.getenv("MAPBOX_ACCESS_TOKEN", "")
     MAP_TILE_PROVIDER: str = os.getenv("MAP_TILE_PROVIDER", "openstreetmap")
-    CACHE_DIR: str = os.getenv("CACHE_DIR", "./diskcache")
+    CACHE_DIR: str = os.getenv("CACHE_DIR", "/tmp/diskcache")
     PRELOAD_TOP_CITIES: int = int(os.getenv("PRELOAD_TOP_CITIES", "12"))
-    LOCAL_CACHE_FILE: str = os.getenv("LOCAL_CACHE_FILE", "./diskcache/cities_data.json")
+    LOCAL_CACHE_FILE: str = os.getenv("LOCAL_CACHE_FILE", "/tmp/cities_data.json")
     MAX_WIKIMEDIA_FILES_TO_SCAN: int = 50
     MAX_IMAGES_PER_REQUEST: int = 6
     WIKIMEDIA_RETRY_ATTEMPTS: int = 3
@@ -39,10 +41,8 @@ config = Config()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# -------------------- DISKCACHE --------------------
 cache = diskcache.Cache(config.CACHE_DIR)
 
-# -------------------- LOCAL JSON CACHE --------------------
 LOCAL_CITY_CACHE: Dict[str, dict] = {}
 if os.path.exists(config.LOCAL_CACHE_FILE):
     try:
@@ -61,7 +61,6 @@ def save_local_cache():
     except Exception as e:
         logger.error(f"Failed to save local cache: {e}")
 
-# -------------------- CACHE CLEARING FUNCTIONS --------------------
 def clear_city_cache(city_names=None):
     """Clear cache for specific cities or all cities"""
     global LOCAL_CITY_CACHE
@@ -77,14 +76,12 @@ def clear_city_cache(city_names=None):
             del LOCAL_CITY_CACHE[city_name]
             logger.info(f"Cleared cache for {city_name}")
 
-    # Also clear disk cache for these cities
     try:
         if city_names is None:
             cache.clear()
             logger.info("Cleared all disk cache")
         else:
             for city_name in city_names:
-                # We need to clear various cache keys that might be associated with this city
                 cache_keys_to_clear = []
                 for key in cache:
                     if isinstance(key, str) and city_name.lower() in key.lower():
@@ -101,12 +98,10 @@ def clear_city_cache(city_names=None):
 
     save_local_cache()
 
-# -------------------- CACHE DECORATORS --------------------
 def disk_cached(ttl=config.CACHE_TTL):
     def decorator(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
-            # build stable cache key, skip self for methods
             args_for_key = args[1:] if len(args) > 0 and hasattr(args[0], "__class__") else args
             try:
                 key = f"{fn.__name__}|{json.dumps({'args': args_for_key,'kwargs': kwargs},default=str,sort_keys=True)}"
@@ -128,7 +123,6 @@ def disk_cached(ttl=config.CACHE_TTL):
         return wrapper
     return decorator
 
-# -------------------- SIMPLE GET WITH SERIALIZABLE CACHE --------------------
 def _make_cache_key(url: str, params: dict = None, headers: dict = None) -> str:
     p = json.dumps(params or {}, sort_keys=True, default=str)
     h = json.dumps(headers or {}, sort_keys=True, default=str)
@@ -250,10 +244,6 @@ class MapProvider:
     def generate_static_map_url(self, coordinates: Optional[Dict[str, float]], width: int = 600, height: int = 400) -> Optional[str]:
         """Return a static map URL using Mapbox if configured else use OpenStreetMap static service"""
         if not coordinates or not self._validate_coordinates(coordinates):
-            # No coordinates - fallback to a generic world map placeholder if present
-            placeholder = "/static/default_world_map.jpg"
-            if os.path.exists(placeholder.lstrip("/")):
-                return placeholder
             return None
 
         lat, lon = coordinates["lat"], coordinates["lon"]
@@ -273,11 +263,6 @@ class MapProvider:
             return f"https://staticmap.openstreetmap.de/staticmap.php?center={lat},{lon}&zoom={zoom}&size={size}&markers={lat},{lon},red-pushpin"
         except Exception:
             pass
-
-        # Last resort - placeholder if present
-        placeholder = "/static/default_world_map.jpg"
-        if os.path.exists(placeholder.lstrip("/")):
-            return placeholder
 
         return None
 
@@ -818,6 +803,7 @@ class CityDataProvider:
 # -------------------- DATA --------------------
 REGIONS = ["Europe", "North America", "Asia", "Oceania", "Middle East", "South America", "Africa"]
 
+# Your WORLD_CITIES data remains the same (truncated for brevity)
 WORLD_CITIES = [
     # EUROPE 
     {"name":"Paris","country":"France","region":"Europe"},
@@ -1637,13 +1623,15 @@ def preload_popular_cities():
         load_all_cities()
     threading.Thread(target=task, daemon=True).start()
 
+# Initialize on first request
+def initialize_app():
+    if not CITIES_LOADED and not CITIES_LOADING:
+        preload_popular_cities()
+
+# -------------------- API ROUTES --------------------
 @app.route("/")
 def serve_frontend():
-    return send_from_directory('.', 'index.html')
-
-@app.route("/static/<path:filename>")
-def serve_static(filename):
-    return send_from_directory('static', filename)
+    return jsonify({"message": "City Explorer API", "status": "healthy"})
 
 @app.route("/api/health")
 def health():
@@ -1660,115 +1648,10 @@ def health():
         "cities_with_images": cities_with_images
     })
 
-@app.route("/api/image-stats")
-def get_image_stats():
-    """Debug endpoint to check image loading statistics"""
-    if not CITIES_LOADED:
-        return jsonify({"error": "Cities still loading"}), 423
-
-    cities_with_images = sum(1 for city in ALL_CITIES_DATA
-                           if city.get("image", {}).get("url") != "/static/default_city.jpg")
-    cities_without_images = len(ALL_CITIES_DATA) - cities_with_images
-
-    # Get sample of cities without images
-    no_image_cities = [city["name"] for city in ALL_CITIES_DATA
-                      if city.get("image", {}).get("url") == "/static/default_city.jpg"][:10]
-
-    return jsonify({
-        "total_cities": len(ALL_CITIES_DATA),
-        "cities_with_images": cities_with_images,
-        "cities_without_images": cities_without_images,
-        "coverage_percentage": round((cities_with_images / len(ALL_CITIES_DATA)) * 100, 2) if ALL_CITIES_DATA else 0.0,
-        "sample_no_image_cities": no_image_cities
-    })
-
-@app.route("/api/debug-images/<path:city_name>")
-def debug_images(city_name):
-    """Debug endpoint to check image fetching for a specific city"""
-    from urllib.parse import unquote
-    city_name = unquote(city_name)
-
-    # Test Wikipedia page lookup
-    page_data, title = data_provider.fetch_wikipedia_page(city_name)
-    wiki_status = "Found" if page_data else "Not found"
-
-    # Test image fetching
-    images = []
-    if title:
-        images = data_provider.get_wikimedia_images(title, limit=6)
-
-    return jsonify({
-        "city": city_name,
-        "wikipedia_page": wiki_status,
-        "wikipedia_title": title,
-        "images_found": len(images),
-        "image_urls": [img.get("url") for img in images],
-        "current_preview_image": LOCAL_CITY_CACHE.get(city_name, {}).get("image", {})
-    })
-
-@app.route("/api/debug-map/<path:city_name>")
-def debug_map(city_name):
-    """Debug endpoint to check map configuration for a specific city"""
-    from urllib.parse import unquote
-    city_name = unquote(city_name)
-
-    # Test coordinate fetching
-    coords_data = data_provider.get_coordinates(city_name)
-    coordinates = None
-    if coords_data:
-        coordinates = {"lat": coords_data[0], "lon": coords_data[1]}
-
-    # Test map configuration
-    map_config = data_provider.map_provider.get_map_config(city_name, coordinates)
-
-    # Test static map URL
-    static_map_url = data_provider.map_provider.generate_static_map_url(coordinates)
-
-    return jsonify({
-        "city": city_name,
-        "coordinates_found": coords_data is not None,
-        "coordinates": coordinates,
-        "coordinates_validation": data_provider.map_provider._validate_coordinates(coordinates) if coordinates else False,
-        "map_config": map_config,
-        "static_map_url": static_map_url,
-        "tile_provider": config.MAP_TILE_PROVIDER,
-        "has_mapbox_token": bool(config.MAPBOX_ACCESS_TOKEN)
-    })
-
-@app.route("/api/clear-cache", methods=["POST"])
-def clear_cache():
-    city_name = request.json.get("city") if request.json else None
-    cities_to_clear = [city_name] if city_name else None
-
-    clear_city_cache(cities_to_clear)
-
-    if city_name:
-        return jsonify({"success": True, "message": f"Cache cleared for {city_name}"})
-    else:
-        return jsonify({"success": True, "message": "All cache cleared"})
-
-@app.route("/api/reload-city", methods=["POST"])
-def reload_city():
-    city_name = request.json.get("city") if request.json else None
-    if not city_name:
-        return jsonify({"success": False, "error": "City name required"}), 400
-
-    # Clear cache for this city
-    clear_city_cache([city_name])
-
-    # Force reload
-    preview = data_provider.get_city_preview(city_name)
-    details = data_provider.get_city_details(city_name)
-
-    return jsonify({
-        "success": True,
-        "message": f"Reloaded {city_name}",
-        "preview": preview,
-        "details": details
-    })
-
 @app.route("/api/cities")
 def get_cities():
+    initialize_app()
+    
     # If all cities are loaded, return them all at once
     if CITIES_LOADED:
         logger.info(f"Returning all {len(ALL_CITIES_DATA)} loaded cities")
@@ -1875,24 +1758,6 @@ def get_city(city_name):
     details["country"] = exact["country"]
     return jsonify({"success": True, "data": details})
 
-@app.route("/api/city-desc/<path:city_name>")
-def get_city_desc(city_name):
-    """Return a short tagline-style description for a given city."""
-    from urllib.parse import unquote
-    city_name = unquote(city_name)
-
-    try:
-        result = data_provider.get_city_tagline(city_name)
-        # Try to enrich with region/country info if available
-        city_info = next((c for c in WORLD_CITIES if c["name"].lower() == city_name.lower()), None)
-        if city_info:
-            result["country"] = city_info.get("country")
-            result["region"] = city_info.get("region")
-        return jsonify(result)
-    except Exception as e:
-        logger.error(f"City tagline fetch failed for {city_name}: {e}")
-        return jsonify({"error": str(e)}), 500
-
 @app.route("/api/search")
 def search_cities():
     q = request.args.get("q", "").strip().lower()
@@ -1919,32 +1784,17 @@ def search_cities():
 
     return jsonify({"success": True, "data": matches})
 
-@app.route("/api/cities-list")
-def get_cities_list():
-    return jsonify({"success": True, "data": WORLD_CITIES})
-
 @app.route("/api/regions")
 def get_regions():
     return jsonify({"success": True, "data": REGIONS})
 
-@app.route("/api/map/config")
-def get_map_config():
-    city_name = request.args.get("city", "")
-    coords = None
-    if city_name:
-        c = data_provider.get_coordinates(city_name)
-        if c:
-            coords = {"lat": c[0], "lon": c[1]}
-    map_conf = data_provider.map_provider.get_map_config(city_name, coords)
-    return jsonify({"success": True, "data": map_conf})
+# Vercel serverless handler
+def handler(request):
+    with app.app_context():
+        response = app.full_dispatch_request()
+        return response
 
-# Debug middleware to log API requests
-@app.after_request
-def after_request(response):
-    if request.path.startswith('/api/'):
-        logger.info(f"API {request.method} {request.path} - Status: {response.status_code}")
-    return response
-
+# For local development
 if __name__ == "__main__":
     logger.info(f"Starting Flask server with {len(WORLD_CITIES)} cities")
     preload_popular_cities()
