@@ -5,3 +5,4 @@ wikipedia-api==0.7.1
 geopy==2.4.1
 diskcache==5.6.3
 werkzeug==3.0.3
+gunicorn==21.2.0

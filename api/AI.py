@@ -1517,7 +1517,14 @@ WORLD_CITIES = [
 # -------------------- FLASK APP --------------------
 app = Flask(__name__)
 CORS(app)
-data_provider = CityDataProvider()
+
+@app.before_first_request
+def init_provider():
+    global data_provider
+    if data_provider is None:
+        data_provider = CityDataProvider()
+
+data_provider = None
 
 # Global variable to store all cities data
 ALL_CITIES_DATA: List[Dict[str, Any]] = []
