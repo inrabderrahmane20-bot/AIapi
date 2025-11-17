@@ -26,7 +26,7 @@ class Config:
     MAX_IMAGE_WORKERS: int = int(os.getenv("MAX_IMAGE_WORKERS", "8"))
     REQUEST_TIMEOUT: int = int(os.getenv("REQUEST_TIMEOUT", "10"))
     FLASK_DEBUG: bool = os.getenv("FLASK_DEBUG", "False").lower() == "true"
-    FLASK_PORT: int = int(os.getenv("FLASK_PORT", "5000"))
+    FLASK_PORT: int = int(os.getenv("PORT", os.getenv("FLASK_PORT", "5000")))
     MAPBOX_ACCESS_TOKEN: str = os.getenv("MAPBOX_ACCESS_TOKEN", "")
     MAP_TILE_PROVIDER: str = os.getenv("MAP_TILE_PROVIDER", "openstreetmap")
     CACHE_DIR: str = os.getenv("CACHE_DIR", "/tmp/diskcache")
@@ -41,7 +41,15 @@ config = Config()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-cache = diskcache.Cache(config.CACHE_DIR)
+# Enhanced cache initialization for Railway
+try:
+    cache_dir = config.CACHE_DIR
+    os.makedirs(cache_dir, exist_ok=True)
+    cache = diskcache.Cache(cache_dir)
+    logger.info(f"Cache initialized at: {cache_dir}")
+except Exception as e:
+    logger.warning(f"Failed to initialize disk cache, using memory: {e}")
+    cache = diskcache.Cache()  # Memory cache fallback
 
 LOCAL_CITY_CACHE: Dict[str, dict] = {}
 if os.path.exists(config.LOCAL_CACHE_FILE):
@@ -216,6 +224,7 @@ class MapProvider:
 
         provider_config = self.tile_providers.get(provider_key, self.tile_providers[default_provider])
 
+        # Always return basic map configuration
         map_config = {
             "tile_provider": provider_key,
             "tile_url": provider_config["url"],
@@ -802,7 +811,6 @@ class CityDataProvider:
 # -------------------- DATA --------------------
 REGIONS = ["Europe", "North America", "Asia", "Oceania", "Middle East", "South America", "Africa"]
 
-# Your WORLD_CITIES data remains the same (truncated for brevity)
 WORLD_CITIES = [
     # EUROPE 
     {"name":"Paris","country":"France","region":"Europe"},
@@ -1517,14 +1525,7 @@ WORLD_CITIES = [
 # -------------------- FLASK APP --------------------
 app = Flask(__name__)
 CORS(app)
-
-@app.before_first_request
-def init_provider():
-    global data_provider
-    if data_provider is None:
-        data_provider = CityDataProvider()
-
-data_provider = None
+data_provider = CityDataProvider()
 
 # Global variable to store all cities data
 ALL_CITIES_DATA: List[Dict[str, Any]] = []
@@ -1634,10 +1635,17 @@ def initialize_app():
     if not CITIES_LOADED and not CITIES_LOADING:
         preload_popular_cities()
 
+@app.before_first_request
+def initialize_on_startup():
+    """Initialize data loading on first request for Railway cold starts"""
+    if not CITIES_LOADED and not CITIES_LOADING:
+        logger.info("First request - initializing city data")
+        preload_popular_cities()
+
 # -------------------- API ROUTES --------------------
 @app.route("/")
 def serve_frontend():
-    return jsonify({"message": "City Explorer API", "status": "healthy"})
+    return jsonify({"message": "City Explorer API", "status": "healthy", "deployed_on": "railway"})
 
 @app.route("/api/health")
 def health():
@@ -1651,7 +1659,8 @@ def health():
         "cities_loaded": CITIES_LOADED,
         "cities_loading": CITIES_LOADING,
         "total_cities": len(WORLD_CITIES),
-        "cities_with_images": cities_with_images
+        "cities_with_images": cities_with_images,
+        "deployed_on": "railway"
     })
 
 @app.route("/api/cities")
@@ -1794,57 +1803,9 @@ def search_cities():
 def get_regions():
     return jsonify({"success": True, "data": REGIONS})
 
-
-# -------------------- VERCEL SERVERLESS HANDLER (FIXED) --------------------
-from werkzeug.test import EnvironBuilder
-from werkzeug.wsgi import ClosingIterator
-
-def handler(request):
-    """
-    Proper Vercel → Flask adapter.
-    Converts the Vercel request into a WSGI environ that Flask understands.
-    """
-    # Build WSGI environ from Vercel request
-    builder = EnvironBuilder(
-        path=request.path,
-        base_url=request.url,
-        method=request.method,
-        headers=request.headers,
-        query_string=request.query_string,
-        data=request.body
-    )
-
-    environ = builder.get_environ()
-
-    # Capture status + headers from Flask
-    status_headers = []
-
-    def start_response(status, headers, exc_info=None):
-        status_headers.append(status)
-        status_headers.append(headers)
-        return lambda x: None  # required by WSGI spec
-
-    # Call Flask as WSGI
-    result = app.wsgi_app(environ, start_response)
-
-    # Collect body
-    body = b"".join(result)
-    if isinstance(result, ClosingIterator):
-        result.close()
-
-    # Extract status + headers
-    status = int(status_headers[0].split(" ")[0])
-    headers = {k: v for k, v in status_headers[1]}
-
-    # Return proper response to Vercel
-    return Response(body, status=status, headers=headers)
-
-
-# -------------------- LOCAL DEVELOPMENT --------------------
+# For Railway production
 if __name__ == "__main__":
-    logger.info(f"Starting Flask server with {len(WORLD_CITIES)} cities")
+    port = int(os.environ.get("PORT", config.FLASK_PORT))
+    logger.info(f"Starting Flask server with {len(WORLD_CITIES)} cities on port {port}")
     preload_popular_cities()
-    app.run(host="0.0.0.0",
-            port=config.FLASK_PORT,
-            debug=config.FLASK_DEBUG,
-            threaded=True)
+    app.run(host="0.0.0.0", port=port, debug=config.FLASK_DEBUG, threaded=True)
