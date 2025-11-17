@@ -216,7 +216,6 @@ class MapProvider:
 
         provider_config = self.tile_providers.get(provider_key, self.tile_providers[default_provider])
 
-        # Always return basic map configuration
         map_config = {
             "tile_provider": provider_key,
             "tile_url": provider_config["url"],
