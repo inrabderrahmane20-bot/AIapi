@@ -1787,14 +1787,57 @@ def search_cities():
 def get_regions():
     return jsonify({"success": True, "data": REGIONS})
 
-# Vercel serverless handler
-def handler(request):
-    with app.app_context():
-        response = app.full_dispatch_request()
-        return response
 
-# For local development
+# -------------------- VERCEL SERVERLESS HANDLER (FIXED) --------------------
+from werkzeug.test import EnvironBuilder
+from werkzeug.wsgi import ClosingIterator
+
+def handler(request):
+    """
+    Proper Vercel → Flask adapter.
+    Converts the Vercel request into a WSGI environ that Flask understands.
+    """
+    # Build WSGI environ from Vercel request
+    builder = EnvironBuilder(
+        path=request.path,
+        base_url=request.url,
+        method=request.method,
+        headers=request.headers,
+        query_string=request.query_string,
+        data=request.body
+    )
+
+    environ = builder.get_environ()
+
+    # Capture status + headers from Flask
+    status_headers = []
+
+    def start_response(status, headers, exc_info=None):
+        status_headers.append(status)
+        status_headers.append(headers)
+        return lambda x: None  # required by WSGI spec
+
+    # Call Flask as WSGI
+    result = app.wsgi_app(environ, start_response)
+
+    # Collect body
+    body = b"".join(result)
+    if isinstance(result, ClosingIterator):
+        result.close()
+
+    # Extract status + headers
+    status = int(status_headers[0].split(" ")[0])
+    headers = {k: v for k, v in status_headers[1]}
+
+    # Return proper response to Vercel
+    return Response(body, status=status, headers=headers)
+
+
+# -------------------- LOCAL DEVELOPMENT --------------------
 if __name__ == "__main__":
     logger.info(f"Starting Flask server with {len(WORLD_CITIES)} cities")
     preload_popular_cities()
-    app.run(host="0.0.0.0", port=config.FLASK_PORT, debug=config.FLASK_DEBUG, threaded=True)
+    app.run(host="0.0.0.0",
+            port=config.FLASK_PORT,
+            debug=config.FLASK_DEBUG,
+            threaded=True)
