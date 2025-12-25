@@ -1,0 +1,54 @@
+functionsDirectory = "C:\\Users\\hp\\Desktop\\Nouveau dossier\\Project\\functions"
+functionsDirectoryOrigin = "config-v1"
+redirectsOrigin = "config"
+plugins = []
+headers = []
+
+[functions]
+
+[functions."*"]
+
+[build]
+publish = "C:\\Users\\hp\\Desktop\\Nouveau dossier\\Project"
+publishOrigin = "config"
+commandOrigin = "config"
+command = "pip install -r requirements.txt"
+functions = "C:\\Users\\hp\\Desktop\\Nouveau dossier\\Project\\functions"
+
+[build.environment]
+
+[build.processing]
+
+[build.processing.css]
+
+[build.processing.html]
+
+[build.processing.images]
+
+[build.processing.js]
+
+[build.services]
+
+[[redirects]]
+from = "/api/*"
+to = "/.netlify/functions/api/:splat"
+status = 200.0
+force = false
+
+[redirects.query]
+
+[redirects.conditions]
+
+[redirects.headers]
+
+[[redirects]]
+from = "/*"
+to = "/index.html"
+status = 200.0
+force = false
+
+[redirects.query]
+
+[redirects.conditions]
+
+[redirects.headers]
