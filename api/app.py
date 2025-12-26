@@ -2465,7 +2465,8 @@ def home():
             "search": "/api/search",
             "regions": "/api/regions",
             "stats": "/api/stats",
-            "cache": "/api/cache"
+            "cache": "/api/cache",
+            "reload": "/api/reload"
         },
         "documentation": "https://github.com/yourusername/city-explorer-api"
     })
@@ -2477,6 +2478,16 @@ def health():
     cache_stats = cache.get_stats()
     request_stats = request_handler.get_performance_stats()
     provider_stats = data_provider.get_stats()
+    
+    # Calculate memory usage
+    def get_memory_usage():
+        """Get current memory usage"""
+        try:
+            import psutil
+            process = psutil.Process()
+            return process.memory_info().rss / 1024 / 1024  # MB
+        except ImportError:
+            return 0
     
     return jsonify({
         "status": "healthy",
@@ -2499,7 +2510,7 @@ def health():
         "performance": {
             **request_stats,
             "active_threads": threading.active_count(),
-            "memory_usage_mb": self._get_memory_usage()
+            "memory_usage_mb": get_memory_usage()
         },
         
         "provider_stats": provider_stats,
@@ -2538,7 +2549,9 @@ def get_cities():
     # Get cities based on filters
     if region or country:
         filtered_cities = []
-        for city_data in city_loader.loaded_cities.values():
+        loaded_cities = city_loader.loaded_cities
+        
+        for city_name, city_data in loaded_cities.items():
             if region and city_data.get('region') != region:
                 continue
             if country and city_data.get('country') != country:
@@ -2594,7 +2607,7 @@ def get_city(city_name):
         return jsonify({
             "success": False,
             "error": "City not found",
-            "suggestions": city_loader.search_cities(city_name, limit=5)
+            "suggestions": city_loader.search_cities(city_name, limit=5) if hasattr(city_loader, 'search_cities') else []
         }), 404
     
     # Get city details
@@ -2614,7 +2627,7 @@ def get_city(city_name):
         logger.error(f"Failed to get details for {city_name}: {e}")
         
         # Try to return at least preview data
-        preview = city_loader.get_city(city_info['name'])
+        preview = city_loader.get_city(city_info['name']) if hasattr(city_loader, 'get_city') else None
         if preview:
             return jsonify({
                 "success": True,
@@ -2642,7 +2655,9 @@ def search_cities():
     limit = min(max(1, limit), 50)
     
     # Search in loaded cities
-    results = city_loader.search_cities(query, limit)
+    results = []
+    if hasattr(city_loader, 'search_cities'):
+        results = city_loader.search_cities(query, limit)
     
     # If we have few results and loading is complete, search in world cities directly
     if len(results) < 5 and not city_loader.is_loading:
@@ -2656,7 +2671,8 @@ def search_cities():
                         city.get('region')
                     )
                     results.append(city_data)
-                except Exception:
+                except Exception as e:
+                    logger.debug(f"Failed to load city {city['name']}: {e}")
                     pass
                 
                 if len(results) >= limit:
@@ -2695,10 +2711,26 @@ def get_stats():
     loader_status = city_loader.get_loading_status()
     cache_stats = cache.get_stats()
     provider_stats = data_provider.get_stats()
+    request_stats = request_handler.get_performance_stats()
     
     # Calculate image success rate
     total_cities = max(loader_status.get('loaded', 1), 1)
     image_success_rate = loader_status.get('with_images', 0) / total_cities
+    
+    def get_improvement_suggestions(success_rate: float) -> List[str]:
+        """Get suggestions for improving data quality"""
+        suggestions = []
+        
+        if success_rate < config.REQUIRED_SUCCESS_RATE:
+            suggestions.append("Consider adding Unsplash API key for fallback images")
+            suggestions.append("Increase WIKIMEDIA_RETRY_ATTEMPTS for better image fetching")
+            suggestions.append("Lower MIN_IMAGE_QUALITY_SCORE to accept more images")
+        
+        coord_rate = loader_status.get('with_coordinates', 0) / total_cities
+        if coord_rate < 0.8:
+            suggestions.append("Add more coordinate sources or improve geocoding queries")
+        
+        return suggestions
     
     return jsonify({
         "city_statistics": {
@@ -2713,12 +2745,12 @@ def get_stats():
         },
         "cache_statistics": cache_stats,
         "provider_statistics": provider_stats,
-        "performance": request_handler.get_performance_stats(),
+        "performance": request_stats,
         "quality_metrics": {
             "target_image_success_rate": f"{config.REQUIRED_SUCCESS_RATE:.0%}",
             "minimum_image_quality_score": config.MIN_IMAGE_QUALITY_SCORE,
             "current_image_quality": "good" if image_success_rate >= config.REQUIRED_SUCCESS_RATE else "needs_improvement",
-            "suggestions": self._get_improvement_suggestions(image_success_rate)
+            "suggestions": get_improvement_suggestions(image_success_rate)
         }
     })
 
@@ -2743,7 +2775,15 @@ def cache_info():
             
             for key in keys_to_clear:
                 # Implementation depends on your cache system
-                pass
+                # For diskcache, you can delete by key
+                try:
+                    if hasattr(cache, 'delete'):
+                        cache.delete(key)
+                    elif hasattr(cache, 'set'):
+                        # Set to None with immediate expiry
+                        cache.set(key, None, expire=0)
+                except Exception as e:
+                    logger.debug(f"Failed to clear cache key {key}: {e}")
             
             return jsonify({
                 "success": True,
@@ -2751,7 +2791,17 @@ def cache_info():
             })
         else:
             # Clear all cache
-            # Implementation depends on your cache system
+            try:
+                if hasattr(cache, 'clear'):
+                    cache.clear()
+                elif hasattr(cache.disk_cache, 'clear'):
+                    cache.disk_cache.clear()
+                # Clear memory cache
+                if hasattr(cache, 'memory_cache'):
+                    cache.memory_cache.clear()
+            except Exception as e:
+                logger.error(f"Failed to clear all cache: {e}")
+            
             return jsonify({
                 "success": True,
                 "message": "All cache cleared"
@@ -2807,8 +2857,13 @@ def reload_city():
         ]
         
         for key in cache_keys:
-            # Clear from cache (implementation depends on your cache)
-            pass
+            try:
+                if hasattr(cache, 'delete'):
+                    cache.delete(key)
+                elif hasattr(cache, 'set'):
+                    cache.set(key, None, expire=0)
+            except Exception:
+                pass
         
         # Reload city data
         details = data_provider.get_city_details_enhanced(
@@ -2818,7 +2873,7 @@ def reload_city():
         )
         
         # Update in loader if exists
-        if city_name in city_loader.loaded_cities:
+        if hasattr(city_loader, 'loaded_cities') and city_name in city_loader.loaded_cities:
             city_loader.loaded_cities[city_name] = data_provider.get_city_preview_enhanced(
                 city_info['name'],
                 city_info.get('country'),
@@ -2839,29 +2894,6 @@ def reload_city():
         }), 500
 
 # ==================== HELPER FUNCTIONS ====================
-def _get_memory_usage():
-    """Get current memory usage (simplified)"""
-    try:
-        import psutil
-        process = psutil.Process()
-        return process.memory_info().rss / 1024 / 1024  # MB
-    except ImportError:
-        return 0
-
-def _get_improvement_suggestions(image_success_rate: float) -> List[str]:
-    """Get suggestions for improving data quality"""
-    suggestions = []
-    
-    if image_success_rate < config.REQUIRED_SUCCESS_RATE:
-        suggestions.append("Consider adding Unsplash API key for fallback images")
-        suggestions.append("Increase WIKIMEDIA_RETRY_ATTEMPTS for better image fetching")
-        suggestions.append("Lower MIN_IMAGE_QUALITY_SCORE to accept more images")
-    
-    if city_loader.loading_status.get('with_coordinates', 0) / max(city_loader.loading_status.get('loaded', 1), 1) < 0.8:
-        suggestions.append("Add more coordinate sources or improve geocoding queries")
-    
-    return suggestions
-
 def initialize_city_data():
     """Initialize the city data (call this with your WORLD_CITIES)"""
     global REGIONS
@@ -2914,44 +2946,23 @@ def rate_limit_exceeded(error):
         "error": "Rate limit exceeded. Please try again later."
     }), 429
 
-# ==================== VERCEL SERVERLESS HANDLER ====================
-# This is required for Vercel serverless deployment
-def handler(event, context):
-    """AWS Lambda/Serverless handler for Vercel"""
-    from flask import Request
-    import json as json_module
-    
-    # Convert API Gateway event to Flask request
-    request = Request(event)
-    
-    # Dispatch the request
-    with app.request_context(request.environ):
-        try:
-            response = app.full_dispatch_request()
-        except Exception as e:
-            response = app.handle_exception(e)
-    
-    # Convert Flask response to API Gateway format
-    return {
-        'statusCode': response.status_code,
-        'headers': dict(response.headers),
-        'body': response.get_data(as_text=True)
-    }
+# ==================== VERCEL COMPATIBILITY ====================
+# For Vercel serverless, we need to export the Flask app
+# Remove the AWS Lambda handler as it's not compatible with Vercel Python
 
 # ==================== MAIN EXECUTION ====================
 if __name__ == '__main__':
-    # This block only runs in local development
-    # In Vercel, the app runs as a serverless function
+    """Local development server"""
     
-    # Load your city data here
-    # WORLD_CITIES = load_your_city_data()  # Implement this function
+    logger.info("🚀 Starting City Explorer API in LOCAL mode")
     
-    if WORLD_CITIES:
+    if WORLD_CITIES and len(WORLD_CITIES) > 0:
         initialize_city_data()
+    else:
+        logger.error("❌ WORLD_CITIES is empty! Add your 1500+ cities data")
     
     port = int(os.environ.get('PORT', 5000))
     
-    logger.info(f"🚀 Starting City Explorer API on port {port}")
     logger.info(f"📊 Total cities: {len(WORLD_CITIES)}")
     logger.info(f"🌍 Regions: {len(REGIONS)}")
     logger.info(f"⚙️ Configuration: CACHE_TTL={config.CACHE_TTL}s, IMAGE_WORKERS={config.MAX_IMAGE_WORKERS}")
@@ -2964,8 +2975,23 @@ if __name__ == '__main__':
         threaded=True
     )
 else:
-    # This runs when imported (e.g., in Vercel serverless)
-    # Initialize with empty data - you'll need to populate WORLD_CITIES
-    logger.info("🔧 Running in serverless mode")
+    """Vercel serverless deployment"""
+    logger.info("🔧 Running in VERCEL serverless mode")
     
-    # Note: You need to call initialize_city_data() after populating WORLD_CITIES
+    # Initialize on Vercel cold start
+    if WORLD_CITIES and len(WORLD_CITIES) > 0:
+        logger.info(f"📊 Found {len(WORLD_CITIES)} cities")
+        
+        def init_in_background():
+            """Initialize in background thread to avoid cold start timeout"""
+            try:
+                initialize_city_data()
+                logger.info("✅ City data initialized on Vercel")
+            except Exception as e:
+                logger.error(f"❌ Failed to initialize city data: {e}")
+        
+        # Start initialization in background thread
+        init_thread = threading.Thread(target=init_in_background, daemon=True)
+        init_thread.start()
+    else:
+        logger.error("❌ WORLD_CITIES is empty in Vercel environment")
