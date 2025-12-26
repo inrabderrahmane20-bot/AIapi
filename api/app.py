@@ -1534,10 +1534,19 @@ class CityLoadingManager:
         
     def initialize_with_world_cities(self, world_cities_data: List[Dict]):
         """Initialize with your world cities data"""
+        if not world_cities_data:
+            logger.error("❌ No world cities data provided!")
+            return
+        
         self.loading_status['total'] = len(world_cities_data)
         self.loading_status['start_time'] = time.time()
+        self.loading_status['loaded'] = 0
+        self.loading_status['failed'] = 0
+        self.loading_status['with_images'] = 0
+        self.loading_status['with_coordinates'] = 0
         
         # Create loading queue
+        self.loading_queue = []
         for city_data in world_cities_data:
             self.loading_queue.append({
                 'name': city_data['name'],
@@ -1550,6 +1559,7 @@ class CityLoadingManager:
         self.loading_queue.sort(key=lambda x: x['priority'], reverse=True)
         
         logger.info(f"📊 Initialized loading manager with {len(self.loading_queue)} cities")
+        logger.info(f"📊 First 5 cities to load: {[c['name'] for c in self.loading_queue[:5]]}")
     
     def _calculate_priority(self, city_data: Dict) -> int:
         """Calculate loading priority for a city"""
@@ -2447,7 +2457,7 @@ WORLD_CITIES = [
     {"name":"Yaren","country":"Nauru","region":"Oceania"},
     {"name":"South Tarawa","country":"Kiribati","region":"Oceania"},
 ]
-REGIONS =  ["Europe", "North America", "Asia", "Oceania", "Middle East", "South America", "Africa"]
+REGIONS = set(["Europe", "North America", "Asia", "Oceania", "Middle East", "South America", "Africa"])
 
 # ==================== API ROUTES ====================
 @app.route('/')
@@ -2537,14 +2547,43 @@ def get_cities():
     page = max(1, page)
     limit = min(max(1, limit), 100)  # Cap at 100 per page
     
-    # Start loading if not started
+    # FIX: If loader hasn't been initialized, initialize it now
+    if city_loader.loading_status['total'] == 0:
+        try:
+            # Extract regions
+            global REGIONS
+            REGIONS.clear()
+            for city in WORLD_CITIES:
+                if 'region' in city:
+                    REGIONS.add(city['region'])
+            
+            # Ensure basic regions
+            basic_regions = {"Europe", "North America", "Asia", "Oceania", "Middle East", "South America", "Africa"}
+            REGIONS.update(basic_regions)
+            
+            city_loader.initialize_with_world_cities(WORLD_CITIES)
+            logger.info(f"📊 Lazy initialization: Loaded {len(WORLD_CITIES)} cities")
+            
+            # Start loading a small batch
+            if not city_loader.is_loading:
+                city_loader.start_loading(batch_size=min(10, config.PRELOAD_TOP_CITIES))
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize city loader: {e}")
+            return jsonify({
+                "success": False,
+                "error": "City data not initialized",
+                "total_cities_in_dataset": len(WORLD_CITIES)
+            }), 500
+    
+    # Start loading if not started and we have data
     if not city_loader.is_loading and city_loader.loading_status['total'] > 0:
         if city_loader.loading_status['loaded'] == 0:
-            # Start with a small batch for first request
-            threading.Thread(
-                target=lambda: city_loader.start_loading(batch_size=config.PRELOAD_TOP_CITIES),
-                daemon=True
-            ).start()
+            # Start with a small batch
+            city_loader.start_loading(batch_size=min(10, config.PRELOAD_TOP_CITIES))
+    
+    # FIX: Always use WORLD_CITIES count as total
+    total_cities_in_dataset = len(WORLD_CITIES)
+    loaded_cities_count = city_loader.loading_status['loaded']
     
     # Get cities based on filters
     if region or country:
@@ -2559,10 +2598,11 @@ def get_cities():
             filtered_cities.append(city_data)
         
         cities_list = filtered_cities
-        total = len(filtered_cities)
+        filtered_total = len(filtered_cities)
     else:
+        # Return loaded cities
         cities_list = list(city_loader.loaded_cities.values())
-        total = len(cities_list)
+        filtered_total = loaded_cities_count
     
     # Apply pagination
     start_idx = (page - 1) * limit
@@ -2570,7 +2610,13 @@ def get_cities():
     paginated_cities = cities_list[start_idx:end_idx]
     
     # Calculate pagination metadata
-    total_pages = (total + limit - 1) // limit
+    # Use the actual total from WORLD_CITIES for pagination info
+    total_pages = max(1, (total_cities_in_dataset + limit - 1) // limit)
+    
+    # Update loading stats
+    loading_status = city_loader.get_loading_status()
+    # Make sure total shows the real number
+    loading_status['total'] = total_cities_in_dataset
     
     return jsonify({
         "success": True,
@@ -2578,17 +2624,47 @@ def get_cities():
         "pagination": {
             "page": page,
             "limit": limit,
-            "total": total,
+            "total": total_cities_in_dataset,  # Show actual total from WORLD_CITIES
             "pages": total_pages,
             "next_page": page + 1 if page < total_pages else None,
             "prev_page": page - 1 if page > 1 else None
         },
         "loading": {
             "complete": not city_loader.is_loading,
-            "loaded": city_loader.loading_status['loaded'],
-            "total": city_loader.loading_status['total'],
-            "progress": f"{(city_loader.loading_status['loaded'] / max(city_loader.loading_status['total'], 1) * 100):.1f}%"
+            "loaded": loaded_cities_count,
+            "total": total_cities_in_dataset,  # Show actual total
+            "progress": f"{(loaded_cities_count / max(total_cities_in_dataset, 1) * 100):.1f}%"
+        },
+        "info": {
+            "total_cities_in_dataset": total_cities_in_dataset,
+            "cities_loaded_so_far": loaded_cities_count,
+            "loading_in_progress": city_loader.is_loading,
+            "regions_available": list(REGIONS)
         }
+    })
+@app.route('/api/debug')
+def debug():
+    """Debug endpoint to check initialization"""
+    return jsonify({
+        "success": True,
+        "world_cities_count": len(WORLD_CITIES),
+        "first_5_cities": WORLD_CITIES[:5],
+        "loader_initialized": city_loader.loading_status['total'] > 0,
+        "loader_total": city_loader.loading_status['total'],
+        "loader_loaded": city_loader.loading_status['loaded'],
+        "loaded_cities_count": len(city_loader.loaded_cities),
+        "is_loading": city_loader.is_loading,
+        "regions": list(REGIONS)
+    })
+
+@app.route('/api/simple-cities')
+def simple_cities():
+    """Simple endpoint that returns city names without loading"""
+    return jsonify({
+        "success": True,
+        "total": len(WORLD_CITIES),
+        "data": [{"name": city["name"], "country": city.get("country"), "region": city.get("region")} for city in WORLD_CITIES[:50]],
+        "message": f"Showing first 50 of {len(WORLD_CITIES)} cities. Use /api/cities for full data."
     })
 
 @app.route('/api/cities/<path:city_name>')
@@ -2898,29 +2974,31 @@ def initialize_city_data():
     """Initialize the city data (call this with your WORLD_CITIES)"""
     global REGIONS
     
-    # Extract unique regions
+    # Clear and extract unique regions from WORLD_CITIES
+    REGIONS.clear()
     for city in WORLD_CITIES:
         if 'region' in city:
             REGIONS.add(city['region'])
     
+    # Ensure we have the basic regions even if no cities for them
+    basic_regions = {"Europe", "North America", "Asia", "Oceania", "Middle East", "South America", "Africa"}
+    REGIONS.update(basic_regions)
+    
     # Initialize city loader
-    city_loader.initialize_with_world_cities(WORLD_CITIES)
-    
-    logger.info(f"✅ Initialized with {len(WORLD_CITIES)} cities and {len(REGIONS)} regions")
-    
-    # Start loading popular cities in background
-    if config.LAZY_LOADING:
-        # Start with a small batch
-        threading.Thread(
-            target=lambda: city_loader.start_loading(batch_size=config.PRELOAD_TOP_CITIES),
-            daemon=True
-        ).start()
+    if len(WORLD_CITIES) > 0:
+        try:
+            city_loader.initialize_with_world_cities(WORLD_CITIES)
+            logger.info(f"✅ Initialized with {len(WORLD_CITIES)} cities and {len(REGIONS)} regions")
+            
+            # Start loading immediately for Vercel (no background threads)
+            if not city_loader.is_loading:
+                # Load a small batch synchronously
+                city_loader.start_loading(batch_size=min(config.PRELOAD_TOP_CITIES, 10))
+                logger.info(f"Started loading {config.PRELOAD_TOP_CITIES} cities")
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize city loader: {e}")
     else:
-        # Start full loading
-        threading.Thread(
-            target=lambda: city_loader.start_loading(),
-            daemon=True
-        ).start()
+        logger.error("❌ WORLD_CITIES is empty!")
 
 # ==================== ERROR HANDLERS ====================
 @app.errorhandler(404)
@@ -2978,20 +3056,30 @@ else:
     """Vercel serverless deployment"""
     logger.info("🔧 Running in VERCEL serverless mode")
     
-    # Initialize on Vercel cold start
+    # Initialize SYNCHRONOUSLY for Vercel (no background threads)
     if WORLD_CITIES and len(WORLD_CITIES) > 0:
         logger.info(f"📊 Found {len(WORLD_CITIES)} cities")
         
-        def init_in_background():
-            """Initialize in background thread to avoid cold start timeout"""
-            try:
-                initialize_city_data()
-                logger.info("✅ City data initialized on Vercel")
-            except Exception as e:
-                logger.error(f"❌ Failed to initialize city data: {e}")
-        
-        # Start initialization in background thread
-        init_thread = threading.Thread(target=init_in_background, daemon=True)
-        init_thread.start()
+        try:
+            # Extract regions
+            REGIONS.clear()
+            for city in WORLD_CITIES:
+                if 'region' in city:
+                    REGIONS.add(city['region'])
+            
+            # Ensure basic regions
+            basic_regions = {"Europe", "North America", "Asia", "Oceania", "Middle East", "South America", "Africa"}
+            REGIONS.update(basic_regions)
+            
+            # Initialize city loader immediately
+            city_loader.initialize_with_world_cities(WORLD_CITIES)
+            logger.info(f"✅ City loader initialized with {len(WORLD_CITIES)} cities")
+            
+            # Start loading a small batch synchronously
+            city_loader.start_loading(batch_size=min(10, config.PRELOAD_TOP_CITIES))
+            logger.info(f"Started loading initial batch of cities")
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize city data: {e}")
     else:
         logger.error("❌ WORLD_CITIES is empty in Vercel environment")
