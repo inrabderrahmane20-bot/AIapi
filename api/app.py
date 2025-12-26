@@ -1532,8 +1532,28 @@ class CityLoadingManager:
         self.is_loading = False
         self.loading_thread = None
         
+    def manual_load_batch(self, count: int = 5):
+        """Manually load a batch of cities via API endpoint"""
+        if self.is_loading:
+            return {"status": "already_loading", "message": "Loading already in progress"}
+        
+        if not self.loading_queue:
+            return {"status": "complete", "message": "All cities already loaded"}
+        
+        result = self.start_loading(count)
+        
+        # Update progress after loading
+        if self.loading_status['start_time']:
+            elapsed = time.time() - self.loading_status['start_time']
+            if self.loading_status['loaded'] > 0:
+                estimated_total = elapsed * self.loading_status['total'] / self.loading_status['loaded']
+                remaining = max(0, estimated_total - elapsed)
+                self.loading_status['estimated_completion'] = remaining
+        
+        return result
+
     def initialize_with_world_cities(self, world_cities_data: List[Dict]):
-        """Initialize with your world cities data"""
+        """Initialize with your world cities data - without auto-starting"""
         if not world_cities_data:
             logger.error("❌ No world cities data provided!")
             return
@@ -1559,7 +1579,7 @@ class CityLoadingManager:
         self.loading_queue.sort(key=lambda x: x['priority'], reverse=True)
         
         logger.info(f"📊 Initialized loading manager with {len(self.loading_queue)} cities")
-        logger.info(f"📊 First 5 cities to load: {[c['name'] for c in self.loading_queue[:5]]}")
+        logger.info("⚠️ Loading will happen on-demand via API calls")
     
     def _calculate_priority(self, city_data: Dict) -> int:
         """Calculate loading priority for a city"""
@@ -1583,105 +1603,84 @@ class CityLoadingManager:
         return priority
     
     def start_loading(self, batch_size: int = None):
-        """Start loading cities in batches"""
+        """Start loading cities - synchronous version for Vercel"""
         if self.is_loading:
-            return
+            return {"status": "already_loading", "loaded": self.loading_status['loaded']}
         
         self.is_loading = True
-        batch_size = batch_size or config.BATCH_SIZE
+        batch_size = batch_size or min(5, config.BATCH_SIZE)  # Small batches for Vercel
         
-        def load_task():
+        try:
             logger.info(f"🚀 Starting city loading (batch size: {batch_size})")
             
-            total_batches = (len(self.loading_queue) + batch_size - 1) // batch_size
+            # Load synchronously within the request
+            loaded_in_batch = 0
+            failed_in_batch = 0
             
-            for batch_num in range(total_batches):
-                if not self.is_loading:
-                    break
-                
-                start_idx = batch_num * batch_size
-                end_idx = min(start_idx + batch_size, len(self.loading_queue))
-                batch = self.loading_queue[start_idx:end_idx]
-                
-                logger.info(f"📦 Processing batch {batch_num + 1}/{total_batches} ({len(batch)} cities)")
-                
-                # Load batch in parallel
-                with ThreadPoolExecutor(max_workers=min(config.MAX_PRELOAD_WORKERS, len(batch))) as executor:
-                    futures = {}
-                    
-                    for city_info in batch:
-                        future = executor.submit(
-                            self.data_provider.get_city_preview_enhanced,
-                            city_info['name'],
-                            city_info.get('country'),
-                            city_info.get('region')
-                        )
-                        futures[future] = city_info
-                    
-                    # Process results
-                    for future in as_completed(futures):
-                        city_info = futures[future]
-                        
-                        try:
-                            city_preview = future.result(timeout=30)
-                            city_name = city_info['name']
-                            
-                            # Store in loaded cities
-                            self.loaded_cities[city_name] = city_preview
-                            self.loading_status['loaded'] += 1
-                            
-                            # Update statistics
-                            if city_preview.get('image') and city_preview['image'].get('url'):
-                                if 'placeholder.com' not in city_preview['image']['url']:
-                                    self.loading_status['with_images'] += 1
-                            
-                            if city_preview.get('coordinates'):
-                                self.loading_status['with_coordinates'] += 1
-                            
-                            # Calculate success rate
-                            success_rate = self.loading_status['loaded'] / self.loading_status['total']
-                            
-                            # Log progress every 50 cities
-                            if self.loading_status['loaded'] % 50 == 0:
-                                elapsed = time.time() - self.loading_status['start_time']
-                                cities_per_second = self.loading_status['loaded'] / elapsed if elapsed > 0 else 0
-                                
-                                logger.info(
-                                    f"📊 Progress: {self.loading_status['loaded']}/{self.loading_status['total']} "
-                                    f"({success_rate:.1%}) | "
-                                    f"Images: {self.loading_status['with_images']} | "
-                                    f"Coords: {self.loading_status['with_coordinates']} | "
-                                    f"Speed: {cities_per_second:.2f} cities/sec"
-                                )
-                            
-                        except Exception as e:
-                            self.loading_status['failed'] += 1
-                            logger.warning(f"Failed to load {city_info['name']}: {e}")
-                
-                # Small delay between batches to be nice to APIs
-                if batch_num < total_batches - 1:
-                    time.sleep(2)
+            # Take a batch from the queue
+            batch = self.loading_queue[:batch_size]
             
-            # Loading complete
+            for city_info in batch:
+                try:
+                    logger.debug(f"Loading city: {city_info['name']}")
+                    
+                    # Load city data SYNCHRONOUSLY
+                    city_preview = self.data_provider.get_city_preview_enhanced(
+                        city_info['name'],
+                        city_info.get('country'),
+                        city_info.get('region')
+                    )
+                    
+                    city_name = city_info['name']
+                    
+                    # Store in loaded cities
+                    self.loaded_cities[city_name] = city_preview
+                    self.loading_status['loaded'] += 1
+                    loaded_in_batch += 1
+                    
+                    # Update statistics
+                    if city_preview.get('image') and city_preview['image'].get('url'):
+                        if 'placeholder.com' not in city_preview['image']['url']:
+                            self.loading_status['with_images'] += 1
+                    
+                    if city_preview.get('coordinates'):
+                        self.loading_status['with_coordinates'] += 1
+                    
+                    logger.info(f"✅ Loaded: {city_name}")
+                    
+                    # Small delay to avoid rate limiting
+                    time.sleep(0.5)
+                    
+                except Exception as e:
+                    self.loading_status['failed'] += 1
+                    failed_in_batch += 1
+                    logger.warning(f"Failed to load {city_info['name']}: {e}")
+            
+            # Remove loaded cities from queue
+            self.loading_queue = self.loading_queue[batch_size:]
+            
+            # Update progress
+            progress = (self.loading_status['loaded'] / max(self.loading_status['total'], 1)) * 100
+            
+            logger.info(f"📊 Batch complete: {loaded_in_batch} loaded, {failed_in_batch} failed")
+            logger.info(f"📊 Overall: {self.loading_status['loaded']}/{self.loading_status['total']} ({progress:.1f}%)")
+            
+            return {
+                "status": "completed",
+                "batch_size": batch_size,
+                "loaded_in_batch": loaded_in_batch,
+                "failed_in_batch": failed_in_batch,
+                "total_loaded": self.loading_status['loaded'],
+                "total_failed": self.loading_status['failed'],
+                "progress": f"{progress:.1f}%",
+                "remaining_in_queue": len(self.loading_queue)
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Loading failed: {e}")
+            return {"status": "error", "error": str(e)}
+        finally:
             self.is_loading = False
-            total_time = time.time() - self.loading_status['start_time']
-            
-            logger.info(f"✅ City loading completed!")
-            logger.info(f"   Total cities: {self.loading_status['loaded']}")
-            logger.info(f"   With images: {self.loading_status['with_images']} ({(self.loading_status['with_images']/self.loading_status['loaded']*100):.1f}%)")
-            logger.info(f"   With coordinates: {self.loading_status['with_coordinates']} ({(self.loading_status['with_coordinates']/self.loading_status['loaded']*100):.1f}%)")
-            logger.info(f"   Failed: {self.loading_status['failed']}")
-            logger.info(f"   Total time: {total_time:.2f} seconds")
-            logger.info(f"   Average: {self.loading_status['loaded']/total_time:.2f} cities/second")
-            
-            # Check if we met quality thresholds
-            image_success_rate = self.loading_status['with_images'] / self.loading_status['loaded']
-            if image_success_rate < config.REQUIRED_SUCCESS_RATE:
-                logger.warning(f"⚠️ Image success rate ({image_success_rate:.1%}) below target ({config.REQUIRED_SUCCESS_RATE:.0%})")
-        
-        # Start loading in background thread
-        self.loading_thread = threading.Thread(target=load_task, daemon=True)
-        self.loading_thread.start()
     
     def get_loading_status(self):
         """Get current loading status"""
@@ -2536,7 +2535,7 @@ def health():
 
 @app.route('/api/cities')
 def get_cities():
-    """Get all cities with pagination"""
+    """Get all cities with pagination - loads cities on demand"""
     # Get query parameters
     page = request.args.get('page', 1, type=int)
     limit = request.args.get('limit', 50, type=int)
@@ -2547,7 +2546,10 @@ def get_cities():
     page = max(1, page)
     limit = min(max(1, limit), 100)  # Cap at 100 per page
     
-    # FIX: If loader hasn't been initialized, initialize it now
+    # FIX: Always show correct total from WORLD_CITIES
+    total_cities_in_dataset = len(WORLD_CITIES)
+    
+    # If loader isn't initialized, initialize it
     if city_loader.loading_status['total'] == 0:
         try:
             # Extract regions
@@ -2562,86 +2564,311 @@ def get_cities():
             REGIONS.update(basic_regions)
             
             city_loader.initialize_with_world_cities(WORLD_CITIES)
-            logger.info(f"📊 Lazy initialization: Loaded {len(WORLD_CITIES)} cities")
-            
-            # Start loading a small batch
-            if not city_loader.is_loading:
-                city_loader.start_loading(batch_size=min(10, config.PRELOAD_TOP_CITIES))
+            logger.info(f"📊 City loader initialized with {len(WORLD_CITIES)} cities")
         except Exception as e:
             logger.error(f"❌ Failed to initialize city loader: {e}")
-            return jsonify({
-                "success": False,
-                "error": "City data not initialized",
-                "total_cities_in_dataset": len(WORLD_CITIES)
-            }), 500
     
-    # Start loading if not started and we have data
-    if not city_loader.is_loading and city_loader.loading_status['total'] > 0:
-        if city_loader.loading_status['loaded'] == 0:
-            # Start with a small batch
-            city_loader.start_loading(batch_size=min(10, config.PRELOAD_TOP_CITIES))
-    
-    # FIX: Always use WORLD_CITIES count as total
-    total_cities_in_dataset = len(WORLD_CITIES)
-    loaded_cities_count = city_loader.loading_status['loaded']
-    
-    # Get cities based on filters
-    if region or country:
-        filtered_cities = []
-        loaded_cities = city_loader.loaded_cities
-        
-        for city_name, city_data in loaded_cities.items():
-            if region and city_data.get('region') != region:
-                continue
-            if country and city_data.get('country') != country:
-                continue
-            filtered_cities.append(city_data)
-        
-        cities_list = filtered_cities
-        filtered_total = len(filtered_cities)
-    else:
-        # Return loaded cities
-        cities_list = list(city_loader.loaded_cities.values())
-        filtered_total = loaded_cities_count
-    
-    # Apply pagination
+    # Calculate which cities to load for this page
     start_idx = (page - 1) * limit
-    end_idx = start_idx + limit
-    paginated_cities = cities_list[start_idx:end_idx]
+    end_idx = min(start_idx + limit, total_cities_in_dataset)
     
-    # Calculate pagination metadata
-    # Use the actual total from WORLD_CITIES for pagination info
+    cities_to_load = []
+    for i in range(start_idx, min(end_idx, start_idx + 20)):  # Load up to 20 cities per request
+        if i < len(WORLD_CITIES):
+            city_info = WORLD_CITIES[i]
+            city_name = city_info['name']
+            
+            # Check if already loaded
+            if city_name not in city_loader.loaded_cities:
+                cities_to_load.append(city_info)
+    
+    # Load cities for this page (synchronously, within request timeout)
+    if cities_to_load:
+        logger.info(f"🔄 Loading {len(cities_to_load)} cities for page {page}")
+        
+        # Load cities one by one (not in parallel to avoid rate limits)
+        for city_info in cities_to_load[:10]:  # Limit to 10 cities per request
+            try:
+                city_preview = data_provider.get_city_preview_enhanced(
+                    city_info['name'],
+                    city_info.get('country'),
+                    city_info.get('region')
+                )
+                
+                city_loader.loaded_cities[city_info['name']] = city_preview
+                city_loader.loading_status['loaded'] += 1
+                
+                # Update statistics
+                if city_preview.get('image') and city_preview['image'].get('url'):
+                    if 'placeholder.com' not in city_preview['image']['url']:
+                        city_loader.loading_status['with_images'] += 1
+                
+                if city_preview.get('coordinates'):
+                    city_loader.loading_status['with_coordinates'] += 1
+                    
+                logger.debug(f"✅ Loaded: {city_info['name']}")
+                
+            except Exception as e:
+                logger.warning(f"Failed to load {city_info['name']}: {e}")
+                city_loader.loading_status['failed'] += 1
+    
+    # Get cities for response
+    cities_list = []
+    
+    if region or country:
+        # Filter by region/country
+        for i in range(start_idx, end_idx):
+            if i < len(WORLD_CITIES):
+                city_info = WORLD_CITIES[i]
+                
+                # Apply filters
+                if region and city_info.get('region') != region:
+                    continue
+                if country and city_info.get('country') != country:
+                    continue
+                
+                city_name = city_info['name']
+                if city_name in city_loader.loaded_cities:
+                    cities_list.append(city_loader.loaded_cities[city_name])
+                else:
+                    # Return basic info for unloaded cities
+                    cities_list.append({
+                        "id": city_name.lower().replace(' ', '-').replace(',', ''),
+                        "name": city_name,
+                        "display_name": city_name,
+                        "summary": f"Loading data for {city_name}...",
+                        "has_details": False,
+                        "image": {
+                            "url": f"https://images.unsplash.com/photo-1519681393784-d120267933ba?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80&txt={quote_plus(city_name[:20])}&txt-size=30",
+                            "title": f"{city_name}",
+                            "description": f"Loading image for {city_name}",
+                            "source": "placeholder",
+                            "width": 800,
+                            "height": 600,
+                            "quality_score": 10
+                        },
+                        "images": [],
+                        "coordinates": None,
+                        "static_map": "https://via.placeholder.com/400x250.png?text=Loading+Map",
+                        "tagline": f"Discover {city_name}",
+                        "tagline_source": "loading",
+                        "last_updated": time.time(),
+                        "country": city_info.get('country'),
+                        "region": city_info.get('region'),
+                        "metadata": {
+                            "image_quality": "loading",
+                            "coordinate_accuracy": "loading",
+                            "data_completeness": 10
+                        }
+                    })
+    else:
+        # Return all cities for this page
+        for i in range(start_idx, end_idx):
+            if i < len(WORLD_CITIES):
+                city_info = WORLD_CITIES[i]
+                city_name = city_info['name']
+                
+                if city_name in city_loader.loaded_cities:
+                    cities_list.append(city_loader.loaded_cities[city_name])
+                else:
+                    # Return basic info for unloaded cities
+                    cities_list.append({
+                        "id": city_name.lower().replace(' ', '-').replace(',', ''),
+                        "name": city_name,
+                        "display_name": city_name,
+                        "summary": f"Loading detailed information for {city_name}...",
+                        "has_details": False,
+                        "image": {
+                            "url": f"https://images.unsplash.com/photo-1519681393784-d120267933ba?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80&txt={quote_plus(city_name[:20])}&txt-size=30",
+                            "title": f"{city_name}",
+                            "description": f"Image for {city_name} is loading",
+                            "source": "placeholder",
+                            "width": 800,
+                            "height": 600,
+                            "quality_score": 10
+                        },
+                        "images": [],
+                        "coordinates": None,
+                        "static_map": "https://via.placeholder.com/400x250.png?text=Loading+Map",
+                        "tagline": f"Explore {city_name}",
+                        "tagline_source": "loading",
+                        "last_updated": time.time(),
+                        "country": city_info.get('country'),
+                        "region": city_info.get('region'),
+                        "metadata": {
+                            "image_quality": "loading",
+                            "coordinate_accuracy": "loading",
+                            "data_completeness": 10
+                        }
+                    })
+    
+    # Calculate pagination
     total_pages = max(1, (total_cities_in_dataset + limit - 1) // limit)
     
-    # Update loading stats
-    loading_status = city_loader.get_loading_status()
-    # Make sure total shows the real number
-    loading_status['total'] = total_cities_in_dataset
+    # Update loader status
+    city_loader.loading_status['total'] = total_cities_in_dataset
     
     return jsonify({
         "success": True,
-        "data": paginated_cities,
+        "data": cities_list,
         "pagination": {
             "page": page,
             "limit": limit,
-            "total": total_cities_in_dataset,  # Show actual total from WORLD_CITIES
+            "total": total_cities_in_dataset,
             "pages": total_pages,
             "next_page": page + 1 if page < total_pages else None,
             "prev_page": page - 1 if page > 1 else None
         },
         "loading": {
-            "complete": not city_loader.is_loading,
-            "loaded": loaded_cities_count,
-            "total": total_cities_in_dataset,  # Show actual total
-            "progress": f"{(loaded_cities_count / max(total_cities_in_dataset, 1) * 100):.1f}%"
+            "complete": False,  # Always false since we load on-demand
+            "loaded": city_loader.loading_status['loaded'],
+            "total": total_cities_in_dataset,
+            "progress": f"{(city_loader.loading_status['loaded'] / max(total_cities_in_dataset, 1) * 100):.1f}%",
+            "message": f"{city_loader.loading_status['loaded']} cities fully loaded. Others will load when accessed."
         },
         "info": {
-            "total_cities_in_dataset": total_cities_in_dataset,
-            "cities_loaded_so_far": loaded_cities_count,
-            "loading_in_progress": city_loader.is_loading,
-            "regions_available": list(REGIONS)
+            "total_cities": total_cities_in_dataset,
+            "fully_loaded_cities": city_loader.loading_status['loaded'],
+            "cities_with_images": city_loader.loading_status['with_images'],
+            "cities_with_coordinates": city_loader.loading_status['with_coordinates'],
+            "loading_strategy": "on-demand (Vercel serverless compatible)"
         }
     })
+
+@app.route('/api/load-batch', methods=['POST'])
+def load_batch():
+    """Manually load a batch of cities"""
+    count = request.args.get('count', 5, type=int)
+    count = min(max(1, count), 20)  # Limit to 20 cities per batch
+    
+    result = city_loader.manual_load_batch(count)
+    
+    return jsonify({
+        "success": True,
+        **result,
+        "info": {
+            "total_cities": len(WORLD_CITIES),
+            "currently_loaded": city_loader.loading_status['loaded'],
+            "in_queue": len(city_loader.loading_queue)
+        }
+    })
+
+@app.route('/api/load-city/<city_name>')
+def load_specific_city(city_name):
+    """Load a specific city by name"""
+    city_name = unquote(city_name)
+    
+    # Find the city
+    city_info = None
+    for city in WORLD_CITIES:
+        if city['name'].lower() == city_name.lower():
+            city_info = city
+            break
+    
+    if not city_info:
+        return jsonify({
+            "success": False,
+            "error": f"City '{city_name}' not found"
+        }), 404
+    
+    try:
+        # Load the city
+        city_data = data_provider.get_city_preview_enhanced(
+            city_info['name'],
+            city_info.get('country'),
+            city_info.get('region')
+        )
+        
+        # Store in loader
+        city_loader.loaded_cities[city_info['name']] = city_data
+        city_loader.loading_status['loaded'] += 1
+        
+        # Update statistics
+        if city_data.get('image') and city_data['image'].get('url'):
+            if 'placeholder.com' not in city_data['image']['url']:
+                city_loader.loading_status['with_images'] += 1
+        
+        if city_data.get('coordinates'):
+            city_loader.loading_status['with_coordinates'] += 1
+        
+        return jsonify({
+            "success": True,
+            "message": f"City '{city_name}' loaded successfully",
+            "city": city_data['name'],
+            "total_loaded": city_loader.loading_status['loaded']
+        })
+        
+    except Exception as e:
+        logger.error(f"Failed to load city {city_name}: {e}")
+        return jsonify({
+            "success": False,
+            "error": f"Failed to load city: {str(e)}"
+        }), 500
+
+@app.route('/api/preload')
+def preload_cities():
+    """Preload popular cities into cache"""
+    popular_cities = [
+        "Paris", "London", "New York", "Tokyo", "Rome",
+        "Dubai", "Barcelona", "Amsterdam", "Berlin", "Sydney"
+    ]
+    
+    loaded = []
+    failed = []
+    
+    for city_name in popular_cities:
+        # Find city in WORLD_CITIES
+        city_info = None
+        for city in WORLD_CITIES:
+            if city['name'] == city_name:
+                city_info = city
+                break
+        
+        if city_info:
+            try:
+                # Load city data
+                city_data = data_provider.get_city_preview_enhanced(
+                    city_info['name'],
+                    city_info.get('country'),
+                    city_info.get('region')
+                )
+                
+                # Store in loader cache
+                city_loader.loaded_cities[city_info['name']] = city_data
+                city_loader.loading_status['loaded'] += 1
+                
+                loaded.append(city_info['name'])
+                logger.info(f"✅ Preloaded: {city_info['name']}")
+                
+            except Exception as e:
+                failed.append(f"{city_info['name']}: {str(e)}")
+                logger.error(f"❌ Failed to preload {city_info['name']}: {e}")
+    
+    return jsonify({
+        "success": True,
+        "message": f"Preloaded {len(loaded)} popular cities",
+        "loaded": loaded,
+        "failed": failed,
+        "total_loaded": city_loader.loading_status['loaded']
+    })
+
+@app.route('/api/loading-status')
+def loading_status():
+    """Check current loading status"""
+    return jsonify({
+        "success": True,
+        "status": {
+            "total_cities": len(WORLD_CITIES),
+            "loaded": city_loader.loading_status['loaded'],
+            "loading_in_progress": city_loader.is_loading,
+            "with_images": city_loader.loading_status['with_images'],
+            "with_coordinates": city_loader.loading_status['with_coordinates'],
+            "failed": city_loader.loading_status['failed'],
+            "progress_percentage": (city_loader.loading_status['loaded'] / max(len(WORLD_CITIES), 1)) * 100
+        },
+        "recently_loaded": list(city_loader.loaded_cities.keys())[-10:] if city_loader.loaded_cities else []
+    })
+
 @app.route('/api/debug')
 def debug():
     """Debug endpoint to check initialization"""
@@ -3056,7 +3283,7 @@ else:
     """Vercel serverless deployment"""
     logger.info("🔧 Running in VERCEL serverless mode")
     
-    # Initialize SYNCHRONOUSLY for Vercel (no background threads)
+    # Initialize SYNCHRONOUSLY without background threads
     if WORLD_CITIES and len(WORLD_CITIES) > 0:
         logger.info(f"📊 Found {len(WORLD_CITIES)} cities")
         
@@ -3071,13 +3298,11 @@ else:
             basic_regions = {"Europe", "North America", "Asia", "Oceania", "Middle East", "South America", "Africa"}
             REGIONS.update(basic_regions)
             
-            # Initialize city loader immediately
+            # Initialize city loader but DON'T start background loading
+            # Vercel will kill background threads on timeout
             city_loader.initialize_with_world_cities(WORLD_CITIES)
             logger.info(f"✅ City loader initialized with {len(WORLD_CITIES)} cities")
-            
-            # Start loading a small batch synchronously
-            city_loader.start_loading(batch_size=min(10, config.PRELOAD_TOP_CITIES))
-            logger.info(f"Started loading initial batch of cities")
+            logger.info("⚠️ Note: Cities will load on-demand when requested (Vercel serverless limitation)")
             
         except Exception as e:
             logger.error(f"❌ Failed to initialize city data: {e}")
