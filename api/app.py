@@ -2236,45 +2236,58 @@ def get_cities():
     page = max(1, page)
     limit = min(max(1, limit), 200)
     
-    # Get cities list
-    if use_preprocessed:
-        # Use pre-processed data
-        all_cities = city_processor.get_all_processed_cities()
-        logger.info(f"📊 Using {len(all_cities)} pre-processed cities")
-    else:
-        # Generate on-demand (fallback)
-        all_cities = []
-        for city_info in WORLD_CITIES:
-            if region and city_info.get('region') != region:
-                continue
-            if country and city_info.get('country') != country:
-                continue
-            
+    # Get cities list - ALWAYS use WORLD_CITIES as source, but enrich with pre-processed data
+    cities_to_process = []
+    
+    for city_info in WORLD_CITIES:
+        # Apply filters early
+        if region and city_info.get('region') != region:
+            continue
+        if country and city_info.get('country') != country:
+            continue
+        
+        if use_preprocessed:
+            # Try to get from pre-processed data
             city_data = city_processor.get_city(city_info['name'])
             if city_data:
-                all_cities.append(city_data)
+                cities_to_process.append(city_data)
             else:
-                # Basic fallback
-                all_cities.append({
+                # Create basic entry if not pre-processed
+                cities_to_process.append({
                     "id": city_info['name'].lower().replace(' ', '-'),
                     "name": city_info['name'],
                     "display_name": city_info['name'],
                     "summary": f"Loading {city_info['name']}...",
                     "has_details": False,
+                    "image": image_fetcher.generate_fallback_image(city_info['name']),
+                    "images": [],
+                    "coordinates": None,
+                    "static_map": "https://via.placeholder.com/400x250.png?text=Loading+Map",
+                    "tagline": f"Explore {city_info['name']}",
+                    "tagline_source": "generated",
+                    "last_updated": time.time(),
                     "country": city_info.get('country'),
-                    "region": city_info.get('region')
+                    "region": city_info.get('region'),
+                    "landmarks": [],
+                    "metadata": {
+                        "image_quality": "basic",
+                        "coordinate_accuracy": "unknown",
+                        "data_completeness": 30
+                    }
                 })
+        else:
+            # Generate on-demand
+            city_data = city_processor.get_city(city_info['name'])
+            if not city_data:
+                city_data = city_processor._process_single_city(
+                    city_info['name'],
+                    city_info.get('country'),
+                    city_info.get('region')
+                )
+            if city_data:
+                cities_to_process.append(city_data)
     
-    # Apply filters
-    filtered_cities = []
-    for city in all_cities:
-        if region and city.get('region') != region:
-            continue
-        if country and city.get('country') != country:
-            continue
-        filtered_cities.append(city)
-    
-    total = len(filtered_cities)
+    total = len(cities_to_process)
     
     # Pagination
     start_idx = (page - 1) * limit
@@ -2284,7 +2297,7 @@ def get_cities():
     
     return jsonify({
         "success": True,
-        "data": filtered_cities[start_idx:end_idx],
+        "data": cities_to_process[start_idx:end_idx],
         "pagination": {
             "page": page,
             "limit": limit,
@@ -2296,7 +2309,12 @@ def get_cities():
             "total": len(WORLD_CITIES),
             "progress": f"{(processing_status['processed'] / max(len(WORLD_CITIES), 1)) * 100:.1f}%",
             "is_processing": processing_status['is_processing'],
-            "using_preprocessed": use_preprocessed and len(all_cities) > 0
+            "using_preprocessed": use_preprocessed
+        },
+        "info": {
+            "showing": f"{start_idx + 1}-{min(end_idx, total)} of {total} cities",
+            "region_filter": region,
+            "country_filter": country
         }
     })
 
