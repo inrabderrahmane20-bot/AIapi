@@ -2,6 +2,8 @@ import os
 import re
 import json
 import time
+import pickle
+from enum import Enum
 import logging
 import threading
 import hashlib
@@ -148,6 +150,396 @@ def clean_text(text: str) -> str:
     return cleaned.strip()
 
 # ==================== ENHANCED CACHING SYSTEM ====================
+class ProcessingState(Enum):
+    NOT_STARTED = "not_started"
+    IN_PROGRESS = "in_progress"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+class ProcessingProgressTracker:
+    """Tracks processing progress across serverless invocations"""
+    
+    def __init__(self):
+        self.redis_client = None
+        self.progress_key = "city_processing:progress"
+        self.state_key = "city_processing:state"
+        self.current_batch_key = "city_processing:current_batch"
+        
+        if os.getenv("REDIS_URL"):
+            try:
+                self.redis_client = redis.from_url(os.getenv("REDIS_URL"))
+                self.redis_client.ping()
+                logger.info("✅ Redis progress tracker connected")
+            except Exception as e:
+                logger.warning(f"⚠️ Redis progress tracker unavailable: {e}")
+                self.redis_client = None
+        
+        # Local fallback
+        self.local_progress_file = "/tmp/processing_progress.json"
+    
+    def get_state(self):
+        """Get current processing state"""
+        if self.redis_client:
+            try:
+                state = self.redis_client.get(self.state_key)
+                if state:
+                    return ProcessingState(state.decode())
+            except:
+                pass
+        
+        # Check local file
+        if os.path.exists(self.local_progress_file):
+            try:
+                with open(self.local_progress_file, 'r') as f:
+                    data = json.load(f)
+                    return ProcessingState(data.get('state', 'not_started'))
+            except:
+                pass
+        
+        return ProcessingState.NOT_STARTED
+    
+    def set_state(self, state: ProcessingState):
+        """Set processing state"""
+        if self.redis_client:
+            try:
+                self.redis_client.set(self.state_key, state.value)
+            except:
+                pass
+        
+        # Save locally
+        try:
+            with open(self.local_progress_file, 'w') as f:
+                json.dump({'state': state.value}, f)
+        except:
+            pass
+    
+    def get_progress(self):
+        """Get processing progress"""
+        if self.redis_client:
+            try:
+                progress_data = self.redis_client.get(self.progress_key)
+                if progress_data:
+                    return json.loads(progress_data)
+            except:
+                pass
+        
+        # Default progress
+        return {
+            'processed': 0,
+            'failed': 0,
+            'total': len(WORLD_CITIES),
+            'batches_completed': 0,
+            'current_index': 0,
+            'start_time': None,
+            'last_update': None
+        }
+    
+    def update_progress(self, processed_increment=0, failed_increment=0, current_index=None):
+        """Update processing progress"""
+        progress = self.get_progress()
+        
+        progress['processed'] += processed_increment
+        progress['failed'] += failed_increment
+        
+        if current_index is not None:
+            progress['current_index'] = current_index
+        
+        if progress['start_time'] is None:
+            progress['start_time'] = time.time()
+        
+        progress['last_update'] = time.time()
+        
+        if self.redis_client:
+            try:
+                self.redis_client.set(self.progress_key, json.dumps(progress))
+            except:
+                pass
+        
+        # Save locally
+        try:
+            with open(self.local_progress_file, 'w') as f:
+                json.dump(progress, f)
+        except:
+            pass
+        
+        return progress
+    
+    def reset_progress(self):
+        """Reset progress to start over"""
+        progress = {
+            'processed': 0,
+            'failed': 0,
+            'total': len(WORLD_CITIES),
+            'batches_completed': 0,
+            'current_index': 0,
+            'start_time': None,
+            'last_update': None
+        }
+        
+        if self.redis_client:
+            try:
+                self.redis_client.set(self.progress_key, json.dumps(progress))
+                self.redis_client.set(self.state_key, ProcessingState.NOT_STARTED.value)
+            except:
+                pass
+        
+        try:
+            with open(self.local_progress_file, 'w') as f:
+                json.dump(progress, f)
+        except:
+            pass
+    
+    def get_current_batch_info(self):
+        """Get info about current batch being processed"""
+        if self.redis_client:
+            try:
+                batch_info = self.redis_client.get(self.current_batch_key)
+                if batch_info:
+                    return json.loads(batch_info)
+            except:
+                pass
+        return None
+    
+class CompleteCityProcessor:
+    """Processes ALL cities in batches with persistent progress tracking"""
+    
+    def __init__(self, data_provider: EnhancedCityDataProvider):
+        self.data_provider = data_provider
+        self.storage_manager = PreprocessedDataManager()
+        self.progress_tracker = ProcessingProgressTracker()
+        self.processed_cities = self.storage_manager.load_all_cities()
+        self.processing_thread = None
+    
+    def process_batch_safe(self, batch_size: int = 50) -> Dict:
+        """
+        Process a single batch SAFELY - won't timeout
+        Returns after processing batch_size cities or reaching end
+        """
+        state = self.progress_tracker.get_state()
+        if state == ProcessingState.COMPLETED:
+            return {
+                'success': True,
+                'message': 'All cities already processed',
+                'processed': len(self.processed_cities),
+                'total': len(WORLD_CITIES)
+            }
+        
+        # Start or resume processing
+        if state == ProcessingState.NOT_STARTED:
+            self.progress_tracker.set_state(ProcessingState.IN_PROGRESS)
+        
+        progress = self.progress_tracker.get_progress()
+        start_index = progress['current_index']
+        
+        # Safety check
+        if start_index >= len(WORLD_CITIES):
+            self.progress_tracker.set_state(ProcessingState.COMPLETED)
+            return {
+                'success': True,
+                'message': 'Processing completed',
+                'processed': len(self.processed_cities),
+                'total': len(WORLD_CITIES)
+            }
+        
+        # Calculate batch
+        end_index = min(start_index + batch_size, len(WORLD_CITIES))
+        batch = WORLD_CITIES[start_index:end_index]
+        
+        logger.info(f"🔧 Processing batch: cities {start_index} to {end_index-1} ({len(batch)} cities)")
+        
+        # Process this batch
+        batch_processed = 0
+        batch_failed = 0
+        
+        with ThreadPoolExecutor(max_workers=min(8, batch_size)) as executor:
+            futures = {}
+            for city_info in batch:
+                future = executor.submit(
+                    self._process_single_city_optimized,
+                    city_info['name'],
+                    city_info.get('country'),
+                    city_info.get('region')
+                )
+                futures[future] = city_info['name']
+            
+            # Process with timeout for each city
+            for future in as_completed(futures):
+                city_name = futures[future]
+                try:
+                    result = future.result(timeout=25)  # 25 second timeout per city
+                    if result:
+                        self.processed_cities[city_name] = result
+                        batch_processed += 1
+                    else:
+                        batch_failed += 1
+                except Exception as e:
+                    logger.error(f"❌ Failed to process {city_name}: {e}")
+                    batch_failed += 1
+        
+        # Update progress
+        new_index = end_index
+        progress = self.progress_tracker.update_progress(
+            processed_increment=batch_processed,
+            failed_increment=batch_failed,
+            current_index=new_index
+        )
+        
+        # Save results
+        if batch_processed > 0:
+            logger.info(f"💾 Saving {batch_processed} new cities to storage...")
+            self.storage_manager.save_all_cities(self.processed_cities)
+        
+        # Check if completed
+        if new_index >= len(WORLD_CITIES):
+            self.progress_tracker.set_state(ProcessingState.COMPLETED)
+            status_message = "✅ PROCESSING COMPLETED"
+        else:
+            status_message = f"📊 Progress: {progress['processed']}/{len(WORLD_CITIES)} cities"
+        
+        return {
+            'success': True,
+            'message': status_message,
+            'batch': {
+                'size': len(batch),
+                'processed': batch_processed,
+                'failed': batch_failed,
+                'start_index': start_index,
+                'end_index': end_index - 1
+            },
+            'progress': {
+                'processed': progress['processed'],
+                'failed': progress['failed'],
+                'total': len(WORLD_CITIES),
+                'percentage': f"{(progress['processed'] / len(WORLD_CITIES)) * 100:.1f}%",
+                'current_index': progress['current_index'],
+                'remaining': len(WORLD_CITIES) - progress['current_index']
+            },
+            'next_batch_available': new_index < len(WORLD_CITIES),
+            'next_batch_start': new_index if new_index < len(WORLD_CITIES) else None
+        }
+    
+    def _process_single_city_optimized(self, city_name: str, country: str = None, region: str = None):
+        """Optimized city processing with fallbacks"""
+        try:
+            # Check cache first
+            cache_key = f"preview:{city_name}:{country}:{region}"
+            cached = cache.get(cache_key)
+            if cached:
+                return cached
+            
+            # Get coordinates (fastest first)
+            coords = None
+            try:
+                coords_result = self.data_provider.get_coordinates_enhanced(city_name, country, region)
+                if coords_result:
+                    lat, lon, _ = coords_result
+                    coords = {"lat": lat, "lon": lon}
+            except:
+                pass
+            
+            # Get Wikipedia data (parallel potential)
+            wiki_data = None
+            try:
+                wiki_data, wiki_title = self.data_provider.get_wikipedia_data_enhanced(city_name, country)
+            except:
+                pass
+            
+            # Get images (can be slow, limit)
+            images = []
+            try:
+                if wiki_data:
+                    images = image_fetcher.get_images_for_city(
+                        city_name,
+                        wiki_title or city_name,
+                        limit=2  # Just 2 images for batch processing
+                    )
+            except:
+                pass
+            
+            # Build result
+            result = {
+                "id": self.data_provider._generate_city_id(city_name),
+                "name": city_name,
+                "display_name": wiki_data.get('title', city_name) if wiki_data else city_name,
+                "summary": wiki_data.get('summary', f"Discover {city_name}, a city in {country or 'the world'}") if wiki_data else f"A city in {country or 'the world'}",
+                "has_details": wiki_data is not None,
+                "image": images[0] if images else image_fetcher.generate_fallback_image(city_name),
+                "images": images[:3],  # Max 3 images
+                "coordinates": coords,
+                "static_map": map_provider.generate_static_map_url(coords, width=400, height=250) if coords else f"https://via.placeholder.com/400x250.png?text={quote_plus(city_name)}",
+                "tagline": f"Explore {city_name}" if not wiki_data else (wiki_data.get('summary', '').split('.')[0] + '.' if wiki_data.get('summary') else f"Discover {city_name}"),
+                "tagline_source": "wikipedia" if wiki_data else "generated",
+                "last_updated": time.time(),
+                "country": country,
+                "region": region,
+                "landmarks": self.data_provider.extract_landmarks_from_wiki(wiki_data, city_name) if wiki_data else [],
+                "metadata": {
+                    "image_quality": "good" if images else "basic",
+                    "coordinate_accuracy": "good" if coords else "unknown",
+                    "data_completeness": 60 if wiki_data and coords and images else (40 if wiki_data or coords else 20)
+                }
+            }
+            
+            # Cache it
+            cache.set(cache_key, result, config.CACHE_TTL)
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to process {city_name}: {e}")
+            
+            # Return minimal data
+            return {
+                "id": city_name.lower().replace(' ', '-').replace(',', ''),
+                "name": city_name,
+                "display_name": city_name,
+                "summary": f"A city in {country or 'the world'}",
+                "has_details": False,
+                "image": image_fetcher.generate_fallback_image(city_name),
+                "images": [],
+                "coordinates": None,
+                "static_map": f"https://via.placeholder.com/400x250.png?text={quote_plus(city_name)}",
+                "tagline": f"Discover {city_name}",
+                "tagline_source": "generated",
+                "last_updated": time.time(),
+                "country": country,
+                "region": region,
+                "landmarks": [],
+                "metadata": {
+                    "image_quality": "basic",
+                    "coordinate_accuracy": "unknown",
+                    "data_completeness": 20
+                }
+            }
+    
+    def get_processing_status(self):
+        """Get current processing status"""
+        state = self.progress_tracker.get_state()
+        progress = self.progress_tracker.get_progress()
+        
+        status = {
+            'state': state.value,
+            'progress': progress,
+            'stats': {
+                'total_cities': len(WORLD_CITIES),
+                'processed_cities': len(self.processed_cities),
+                'percentage': f"{(len(self.processed_cities) / len(WORLD_CITIES)) * 100:.1f}%"
+            }
+        }
+        
+        # Calculate estimated time remaining
+        if progress['start_time'] and progress['processed'] > 0:
+            elapsed = time.time() - progress['start_time']
+            cities_per_second = progress['processed'] / elapsed
+            remaining = len(WORLD_CITIES) - progress['current_index']
+            if cities_per_second > 0:
+                estimated_seconds = remaining / cities_per_second
+                status['estimated_remaining_seconds'] = estimated_seconds
+                status['estimated_completion'] = datetime.fromtimestamp(time.time() + estimated_seconds).isoformat()
+        
+        return status
+
 class MultiLevelCache:
     def __init__(self):
         self.memory_cache = {}
@@ -2127,6 +2519,44 @@ def home():
         }
     })
 
+@app.route('/api/init-processing', methods=['POST'])
+def init_processing():
+    """Initialize processing - safe for Vercel timeout"""
+    
+    # Process just the first 50 cities
+    initial_batch = WORLD_CITIES[:50]
+    
+    processed_count = 0
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = []
+        for city_info in initial_batch:
+            future = executor.submit(
+                data_provider.get_city_preview_enhanced,
+                city_info['name'],
+                city_info.get('country'),
+                city_info.get('region')
+            )
+            futures.append((future, city_info['name']))
+        
+        for future, city_name in futures:
+            try:
+                result = future.result(timeout=20)
+                if result:
+                    city_processor.processed_cities[city_name] = result
+                    processed_count += 1
+            except Exception as e:
+                logger.error(f"Failed to process {city_name}: {e}")
+    
+    # Save results
+    if processed_count > 0:
+        city_processor.storage_manager.save_all_cities(city_processor.processed_cities)
+    
+    return jsonify({
+        "success": True,
+        "message": f"Processed {processed_count} initial cities",
+        "next_step": "Cron jobs will continue processing the rest"
+    })
+
 @app.route('/api/health')
 def health():
     processing_status = city_processor.get_processing_status()
@@ -2151,6 +2581,226 @@ def health():
         "cache": cache_stats,
         "performance": request_stats,
         "provider_stats": provider_stats
+    })
+
+@app.route('/api/process/start', methods=['POST'])
+def start_processing():
+    """Start or resume city processing"""
+    batch_size = request.args.get('batch_size', 50, type=int)
+    batch_size = min(max(10, batch_size), 100)  # Between 10 and 100
+    
+    # Process one batch immediately
+    result = city_processor.process_batch_safe(batch_size)
+    
+    return jsonify({
+        "success": True,
+        "message": "Processing started/resumed",
+        "batch_result": result,
+        "next_action": "Call /api/process/next to continue processing"
+    })
+
+@app.route('/api/process/next', methods=['POST'])
+def process_next_batch():
+    """Process the next batch"""
+    batch_size = request.args.get('batch_size', 50, type=int)
+    batch_size = min(max(10, batch_size), 100)
+    
+    result = city_processor.process_batch_safe(batch_size)
+    
+    return jsonify({
+        "success": True,
+        "result": result,
+        "continue_url": f"/api/process/next?batch_size={batch_size}" if result.get('next_batch_available') else None
+    })
+
+@app.route('/api/process/auto', methods=['POST'])
+def process_auto():
+    """Process multiple batches automatically (for serverless)"""
+    max_batches = request.args.get('max_batches', 3, type=int)
+    batch_size = request.args.get('batch_size', 30, type=int)
+    
+    max_batches = min(max(1, max_batches), 10)
+    batch_size = min(max(10, batch_size), 50)
+    
+    results = []
+    total_processed = 0
+    
+    for i in range(max_batches):
+        logger.info(f"Processing batch {i+1}/{max_batches}")
+        result = city_processor.process_batch_safe(batch_size)
+        
+        results.append(result)
+        
+        if not result.get('next_batch_available'):
+            break
+        
+        # Small delay between batches
+        if i < max_batches - 1 and result.get('next_batch_available'):
+            time.sleep(1)
+    
+    return jsonify({
+        "success": True,
+        "batches_processed": len(results),
+        "results": results,
+        "summary": {
+            "total_cities_processed": sum(r['batch']['processed'] for r in results if 'batch' in r),
+            "total_cities_failed": sum(r['batch']['failed'] for r in results if 'batch' in r),
+            "current_progress": city_processor.get_processing_status()['stats']
+        }
+    })
+
+@app.route('/api/process/status')
+def get_processing_status():
+    """Get processing status"""
+    status = city_processor.get_processing_status()
+    return jsonify({
+        "success": True,
+        "status": status
+    })
+
+@app.route('/api/process/reset', methods=['POST'])
+def reset_processing():
+    """Reset processing progress"""
+    city_processor.progress_tracker.reset_progress()
+    return jsonify({
+        "success": True,
+        "message": "Processing progress reset"
+    })
+
+@app.route('/api/process-batch', methods=['POST'])
+def process_batch():
+    """Process a single batch of cities (safe for Vercel timeout)"""
+    batch_size = request.args.get('batch_size', 50, type=int)
+    start_index = request.args.get('start', 0, type=int)
+    
+    batch_size = min(max(1, batch_size), 100)  # Max 100 per batch
+    
+    # Get the batch to process
+    end_index = min(start_index + batch_size, len(WORLD_CITIES))
+    batch = WORLD_CITIES[start_index:end_index]
+    
+    if not batch:
+        return jsonify({
+            "success": False,
+            "message": "No more cities to process"
+        }), 400
+    
+    logger.info(f"Processing batch {start_index} to {end_index-1} ({len(batch)} cities)")
+    
+    # Process this batch
+    processed_count = 0
+    failed_count = 0
+    
+    with ThreadPoolExecutor(max_workers=min(4, batch_size)) as executor:
+        futures = []
+        for city_info in batch:
+            future = executor.submit(
+                data_provider.get_city_preview_enhanced,
+                city_info['name'],
+                city_info.get('country'),
+                city_info.get('region')
+            )
+            futures.append((future, city_info['name']))
+        
+        for future, city_name in futures:
+            try:
+                result = future.result(timeout=30)
+                if result:
+                    city_processor.processed_cities[city_name] = result
+                    processed_count += 1
+                else:
+                    failed_count += 1
+            except Exception as e:
+                logger.error(f"Failed to process {city_name}: {e}")
+                failed_count += 1
+    
+    # Save results
+    if processed_count > 0:
+        city_processor.storage_manager.save_all_cities(city_processor.processed_cities)
+    
+    next_start = end_index if end_index < len(WORLD_CITIES) else None
+    
+    return jsonify({
+        "success": True,
+        "message": f"Processed {processed_count} cities, failed: {failed_count}",
+        "batch": {
+            "start": start_index,
+            "end": end_index - 1,
+            "size": len(batch),
+            "processed": processed_count,
+            "failed": failed_count
+        },
+        "progress": {
+            "total_processed": len(city_processor.processed_cities),
+            "total_cities": len(WORLD_CITIES),
+            "percentage": f"{(len(city_processor.processed_cities) / len(WORLD_CITIES)) * 100:.1f}%",
+            "next_batch_start": next_start
+        },
+        "next_url": f"/api/process-batch?start={end_index}&batch_size={batch_size}" if next_start else None
+    })
+
+@app.route('/api/cron/process-cities', methods=['POST'])
+def cron_process_cities():
+    """Cron job endpoint to process cities in batches"""
+    # Verify cron secret (for security)
+    cron_secret = request.headers.get('X-Cron-Secret')
+    expected_secret = os.getenv('CRON_SECRET')
+    
+    if expected_secret and cron_secret != expected_secret:
+        return jsonify({
+            "success": False,
+            "error": "Unauthorized"
+        }), 401
+    
+    batch_size = 30  # Small batch size for cron jobs
+    max_batches = 2  # Process max 2 batches per cron run
+    
+    results = []
+    
+    # Get current progress
+    current_count = len(city_processor.processed_cities)
+    
+    if current_count >= len(WORLD_CITIES):
+        return jsonify({
+            "success": True,
+            "message": "All cities already processed",
+            "processed": current_count,
+            "total": len(WORLD_CITIES)
+        })
+    
+    # Process up to max_batches
+    next_start = current_count
+    
+    for i in range(max_batches):
+        if next_start >= len(WORLD_CITIES):
+            break
+            
+        # Make internal request to process batch
+        with app.test_client() as client:
+            response = client.post(
+                f'/api/process-batch?start={next_start}&batch_size={batch_size}',
+                headers={'Content-Type': 'application/json'}
+            )
+            
+            if response.status_code == 200:
+                data = json.loads(response.data)
+                results.append(data)
+                next_start = data.get('progress', {}).get('next_batch_start')
+                if not next_start:
+                    break
+            else:
+                break
+    
+    return jsonify({
+        "success": True,
+        "batches_processed": len(results),
+        "results": results,
+        "summary": {
+            "total_processed": len(city_processor.processed_cities),
+            "total_cities": len(WORLD_CITIES),
+            "remaining": len(WORLD_CITIES) - len(city_processor.processed_cities),
+            "percentage": f"{(len(city_processor.processed_cities) / len(WORLD_CITIES)) * 100:.1f}%"
+        }
     })
 
 @app.route('/api/preprocess/start', methods=['POST'])
@@ -2226,78 +2876,72 @@ def get_preprocess_results():
 
 @app.route('/api/cities')
 def get_cities():
-    """Get ALL cities from pre-processed data with pagination"""
+    """Get ALL cities - uses pre-processed data when available"""
     page = request.args.get('page', 1, type=int)
     limit = request.args.get('limit', 100, type=int)
     region = request.args.get('region', type=str)
     country = request.args.get('country', type=str)
-    use_preprocessed = request.args.get('use_preprocessed', 'true').lower() == 'true'
     
     page = max(1, page)
     limit = min(max(1, limit), 200)
     
-    # Get cities list - ALWAYS use WORLD_CITIES as source, but enrich with pre-processed data
-    cities_to_process = []
-    
+    # Get cities (filtered)
+    filtered_cities = []
     for city_info in WORLD_CITIES:
-        # Apply filters early
         if region and city_info.get('region') != region:
             continue
         if country and city_info.get('country') != country:
             continue
+        filtered_cities.append(city_info)
+    
+    total = len(filtered_cities)
+    
+    # Paginate
+    start_idx = (page - 1) * limit
+    end_idx = min(start_idx + limit, total)
+    
+    # Get city data
+    cities_data = []
+    for i in range(start_idx, min(end_idx, len(filtered_cities))):
+        city_info = filtered_cities[i]
+        city_name = city_info['name']
         
-        if use_preprocessed:
-            # Try to get from pre-processed data
-            city_data = city_processor.get_city(city_info['name'])
-            if city_data:
-                cities_to_process.append(city_data)
-            else:
-                # Create basic entry if not pre-processed
-                cities_to_process.append({
-                    "id": city_info['name'].lower().replace(' ', '-'),
-                    "name": city_info['name'],
-                    "display_name": city_info['name'],
-                    "summary": f"Loading {city_info['name']}...",
-                    "has_details": False,
-                    "image": image_fetcher.generate_fallback_image(city_info['name']),
-                    "images": [],
-                    "coordinates": None,
-                    "static_map": "https://via.placeholder.com/400x250.png?text=Loading+Map",
-                    "tagline": f"Explore {city_info['name']}",
-                    "tagline_source": "generated",
-                    "last_updated": time.time(),
-                    "country": city_info.get('country'),
-                    "region": city_info.get('region'),
-                    "landmarks": [],
-                    "metadata": {
-                        "image_quality": "basic",
-                        "coordinate_accuracy": "unknown",
-                        "data_completeness": 30
-                    }
-                })
+        # Try to get processed data
+        city_data = city_processor.processed_cities.get(city_name)
+        
+        if city_data:
+            cities_data.append(city_data)
         else:
-            # Generate on-demand
-            city_data = city_processor.get_city(city_info['name'])
-            if not city_data:
-                city_data = city_processor._process_single_city(
-                    city_info['name'],
+            # Get on-demand (with timeout protection)
+            try:
+                # Quick processing with timeout
+                city_data = data_provider.get_city_preview_enhanced(
+                    city_name,
                     city_info.get('country'),
                     city_info.get('region')
                 )
-            if city_data:
-                cities_to_process.append(city_data)
-    
-    total = len(cities_to_process)
-    
-    # Pagination
-    start_idx = (page - 1) * limit
-    end_idx = min(start_idx + limit, total)
+                cities_data.append(city_data)
+                
+                # Cache it
+                city_processor.processed_cities[city_name] = city_data
+            except Exception as e:
+                logger.debug(f"Quick processing failed for {city_name}: {e}")
+                # Fallback
+                cities_data.append({
+                    "id": city_name.lower().replace(' ', '-'),
+                    "name": city_name,
+                    "display_name": city_name,
+                    "summary": f"Loading {city_name}...",
+                    "has_details": False,
+                    "country": city_info.get('country'),
+                    "region": city_info.get('region')
+                })
     
     processing_status = city_processor.get_processing_status()
     
     return jsonify({
         "success": True,
-        "data": cities_to_process[start_idx:end_idx],
+        "data": cities_data,
         "pagination": {
             "page": page,
             "limit": limit,
@@ -2305,16 +2949,11 @@ def get_cities():
             "pages": (total + limit - 1) // limit
         },
         "processing": {
-            "processed": processing_status['processed'],
-            "total": len(WORLD_CITIES),
-            "progress": f"{(processing_status['processed'] / max(len(WORLD_CITIES), 1)) * 100:.1f}%",
-            "is_processing": processing_status['is_processing'],
-            "using_preprocessed": use_preprocessed
-        },
-        "info": {
-            "showing": f"{start_idx + 1}-{min(end_idx, total)} of {total} cities",
-            "region_filter": region,
-            "country_filter": country
+            "state": processing_status['state'],
+            "processed": processing_status['stats']['processed_cities'],
+            "total": processing_status['stats']['total_cities'],
+            "percentage": processing_status['stats']['percentage'],
+            "estimated_remaining_seconds": processing_status.get('estimated_remaining_seconds')
         }
     })
 
