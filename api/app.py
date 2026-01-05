@@ -2534,7 +2534,8 @@ def home():
             "city_details": "/api/cities/<city_name> (full details)",
             "search": "/api/search",
             "stats": "/api/stats"
-        }
+        },
+        "note": "WORLD_CITIES list is currently empty. Add city data to populate the API."
     })
 
 @app.route('/api/health')
@@ -2548,6 +2549,8 @@ def health():
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "mode": "minimal-preview",
+        "world_cities_count": len(WORLD_CITIES),
+        "note": "WORLD_CITIES is empty. Add city data to enable city listings.",
         "city_loading": loader_status,
         "cache": cache_stats,
         "performance": request_stats,
@@ -2564,6 +2567,26 @@ def get_cities():
     region = request.args.get('region', type=str)
     country = request.args.get('country', type=str)
     
+    # Add debug logging
+    logger.info(f"📊 /api/cities called. WORLD_CITIES length: {len(WORLD_CITIES)}")
+    
+    if len(WORLD_CITIES) == 0:
+        logger.warning("⚠️ WORLD_CITIES is empty! No cities to display.")
+        return jsonify({
+            "success": True,
+            "data": [],
+            "pagination": {
+                "limit": limit,
+                "next_page": None,
+                "page": page,
+                "pages": 1,
+                "prev_page": None,
+                "total": 0
+            },
+            "note": "WORLD_CITIES list is empty. Add city data to enable city listings.",
+            "mode": "minimal-preview"
+        })
+    
     page = max(1, page)
     limit = min(max(1, limit), 100)
     
@@ -2573,6 +2596,8 @@ def get_cities():
         filtered_cities = [c for c in filtered_cities if c.get('region') == region]
     if country:
         filtered_cities = [c for c in filtered_cities if c.get('country') == country]
+    
+    logger.info(f"📊 Filtered cities: {len(filtered_cities)}")
     
     total_cities = len(filtered_cities)
     start_idx = (page - 1) * limit
@@ -2639,7 +2664,7 @@ def get_cities():
 @app.route('/api/cities/<path:city_name>')
 def get_city(city_name):
     """
-    ENDPOINT 2: Returns ALL images and REAL landmarks
+    ENDPOINT 2: Returns ALL images and REAL landmarks for a specific city
     """
     city_name = unquote(city_name)
     
@@ -2651,7 +2676,84 @@ def get_city(city_name):
             break
     
     if not city_info:
-        return jsonify({"success": False, "error": "City not found"}), 404
+        # Even if not in WORLD_CITIES, try to fetch data for any city name
+        logger.info(f"City '{city_name}' not in WORLD_CITIES list, attempting to fetch data anyway")
+        try:
+            # Get ALL images
+            all_images = image_fetcher.get_images_for_city(
+                city_name,
+                city_name,  # Use city name as page title
+                limit=config.MAX_IMAGES_PER_REQUEST
+            )
+            
+            # Get Wikipedia data for landmarks
+            wiki_data, wiki_title = data_provider.get_wikipedia_data_enhanced(
+                city_name,
+                None
+            )
+            
+            # Extract REAL landmarks from Wikipedia sections
+            landmarks = []
+            if wiki_data and wiki_data.get('sections'):
+                for section in wiki_data.get('sections', []):
+                    section_title = section.get('title', '').lower()
+                    section_content = section.get('content', '').lower()
+                    
+                    # Look for actual landmarks in content
+                    if any(keyword in section_title for keyword in ['landmarks', 'attractions', 'architecture', 'monuments', 'tourist']):
+                        # This section is about landmarks - extract specific ones
+                        lines = section_content.split('.')
+                        for line in lines:
+                            line = line.strip()
+                            if len(line) > 20 and any(word in line for word in [' is ', ' was ', ' built ', ' constructed ', ' located ', ' famous ', ' known ']):
+                                # Likely a landmark description
+                                landmarks.append(line[:100] + '...')
+            
+            # If no landmarks found in sections, use some from the summary
+            if not landmarks and wiki_data and wiki_data.get('summary'):
+                summary = wiki_data.get('summary', '')
+                # Look for famous things mentioned
+                sentences = summary.split('.')
+                for sentence in sentences[:5]:
+                    sentence = sentence.strip()
+                    if len(sentence) > 30 and any(word in sentence.lower() for word in ['famous', 'known', 'notable', 'major', 'popular']):
+                        landmarks.append(sentence[:150] + '...')
+            
+            # Get coordinates
+            coords_result = data_provider.get_coordinates_enhanced(
+                city_name,
+                None,
+                None
+            )
+            
+            coordinates = None
+            if coords_result:
+                lat, lon, _ = coords_result
+                coordinates = {"lat": lat, "lon": lon}
+            
+            return jsonify({
+                "success": True,
+                "data": {
+                    "id": city_name.lower().replace(' ', '-'),
+                    "name": city_name,
+                    "country": None,
+                    "region": None,
+                    "all_images": all_images,
+                    "image_count": len(all_images),
+                    "landmarks": landmarks[:10],
+                    "wiki_summary": wiki_data.get('summary', '') if wiki_data else "",
+                    "wiki_url": wiki_data.get('fullurl', '') if wiki_data else "",
+                    "coordinates": coordinates,
+                    "note": "City fetched dynamically (not in WORLD_CITIES list)"
+                }
+            })
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch city {city_name} dynamically: {e}")
+            return jsonify({
+                "success": False,
+                "error": f"City '{city_name}' not found and could not be fetched dynamically"
+            }), 404
     
     try:
         # Get ALL images
@@ -2742,9 +2844,16 @@ def search_cities():
     limit = request.args.get('limit', 20, type=int)
     limit = min(max(1, limit), 50)
     
-    # Load WORLD_CITIES if not loaded
-    if not WORLD_CITIES:
-        load_world_cities()
+    # Check if WORLD_CITIES is empty
+    if len(WORLD_CITIES) == 0:
+        return jsonify({
+            "success": True,
+            "query": query,
+            "count": 0,
+            "data": [],
+            "note": "WORLD_CITIES list is empty. Add city data to enable search.",
+            "data_type": "minimal_preview"
+        })
     
     results = []
     
@@ -2808,7 +2917,8 @@ def get_stats():
     
     return jsonify({
         "city_statistics": {
-            "total_cities": len(WORLD_CITIES) if WORLD_CITIES else 0,
+            "total_cities_in_list": len(WORLD_CITIES),
+            "note": "WORLD_CITIES is empty. Add city data to enable city listings.",
             "previews_loaded": loader_status.get('previews_loaded', 0),
             "details_loaded": loader_status.get('details_loaded', 0),
         },
@@ -2833,43 +2943,14 @@ def internal_error(error):
         "error": "Internal server error"
     }), 500
 
-def load_world_cities():
-    """Load world cities from JSON file or environment variable"""
-    global WORLD_CITIES
-    
-    try:
-        # Try to load from JSON file
-        cities_file = os.getenv("CITIES_JSON_FILE", "/tmp/cities.json")
-        if os.path.exists(cities_file):
-            with open(cities_file, 'r') as f:
-                WORLD_CITIES = json.load(f)
-                logger.info(f"✅ Loaded {len(WORLD_CITIES)} cities from {cities_file}")
-                return
-        
-        # Try to load from environment variable
-        cities_json = os.getenv("WORLD_CITIES_JSON")
-        if cities_json:
-            WORLD_CITIES = json.loads(cities_json)
-            logger.info(f"✅ Loaded {len(WORLD_CITIES)} cities from environment")
-            return
-        
-        # Fallback to empty list
-        WORLD_CITIES = []
-        logger.warning("⚠️ No city data found. Please provide cities data.")
-        
-    except Exception as e:
-        logger.error(f"❌ Failed to load world cities: {e}")
-        WORLD_CITIES = []
-
 if __name__ == '__main__':
     logger.info("🚀 Starting City Explorer API with MINIMAL PREVIEW MODE")
     
-    load_world_cities()
-    
+    # Initialize with empty WORLD_CITIES
     if WORLD_CITIES and len(WORLD_CITIES) > 0:
         logger.info(f"📊 Total cities: {len(WORLD_CITIES)}")
     else:
-        logger.error("❌ WORLD_CITIES is empty! Please provide city data")
+        logger.info("ℹ️ WORLD_CITIES is empty. Add city data to enable city listings.")
     
     port = int(os.environ.get('PORT', 5000))
     
@@ -2882,9 +2963,7 @@ if __name__ == '__main__':
 else:
     logger.info("🔧 Running in serverless mode with MINIMAL PREVIEW")
     
-    load_world_cities()
-    
     if WORLD_CITIES and len(WORLD_CITIES) > 0:
         logger.info(f"📊 Found {len(WORLD_CITIES)} cities")
     else:
-        logger.error("❌ No city data available")
+        logger.info("ℹ️ WORLD_CITIES is empty. Add city data to enable city listings.")
