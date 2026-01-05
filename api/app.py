@@ -33,6 +33,7 @@ class Config:
     CACHE_TTL: int = int(os.getenv("CACHE_TTL", "7200"))
     CACHE_TTL_IMAGES: int = int(os.getenv("CACHE_TTL_IMAGES", "86400"))
     CACHE_TTL_COORDS: int = int(os.getenv("CACHE_TTL_COORDS", "259200"))
+    CACHE_TTL_PREVIEW: int = int(os.getenv("CACHE_TTL_PREVIEW", "3600"))
     
     MAX_IMAGE_WORKERS: int = int(os.getenv("MAX_IMAGE_WORKERS", "6"))
     MAX_DETAIL_WORKERS: int = int(os.getenv("MAX_DETAIL_WORKERS", "4"))
@@ -57,6 +58,7 @@ class Config:
     
     MAX_WIKIMEDIA_FILES_TO_SCAN: int = 80
     MAX_IMAGES_PER_REQUEST: int = 8
+    MAX_IMAGES_PREVIEW: int = 1
     WIKIMEDIA_RETRY_ATTEMPTS: int = 3
     MIN_IMAGE_WIDTH: int = 400
     MIN_IMAGE_HEIGHT: int = 300
@@ -74,11 +76,10 @@ class Config:
     REQUESTS_PER_MINUTE: int = int(os.getenv("REQUESTS_PER_MINUTE", "30"))
     WIKIMEDIA_RATE_LIMIT: int = int(os.getenv("WIKIMEDIA_RATE_LIMIT", "50"))
     
-    # TEXT HANDLING: NO LIMITS
-    MAX_TEXT_LENGTH: int = 1000000  # Effectively unlimited
-    MAX_SUMMARY_LENGTH: int = 1000000  # No truncation
-    MAX_SECTION_LENGTH: int = 1000000  # No truncation
-    MAX_DETAILED_SUMMARY_LENGTH: int = 1000000  # No truncation
+    MAX_TEXT_LENGTH: int = 1000000
+    MAX_SUMMARY_LENGTH: int = 1000000
+    MAX_SECTION_LENGTH: int = 1000000
+    MAX_DETAILED_SUMMARY_LENGTH: int = 1000000
 
 config = Config()
 
@@ -119,20 +120,17 @@ try:
 except Exception as e:
     logger.warning(f"Could not set up file logging: {e}")
 
-logger.info("🚀 City Explorer API Initializing with FULL TEXT MODE...")
+logger.info("🚀 City Explorer API Initializing with MINIMAL PREVIEW MODE...")
 
 # ==================== TEXT PROCESSING HELPERS ====================
 def clean_text(text: str) -> str:
-    """Clean text without truncation"""
     if not text:
         return ""
     
-    # Remove citations and formatting but keep all content
     cleaned = re.sub(r'\[\d+\]', '', text)
     cleaned = re.sub(r'\{\{.*?\}\}', '', cleaned)
     cleaned = re.sub(r'<[^>]+>', '', cleaned)
     
-    # Clean up whitespace but preserve paragraphs
     cleaned = re.sub(r'\n\s*\n', '\n\n', cleaned)
     cleaned = re.sub(r'\s+', ' ', cleaned)
     
@@ -220,6 +218,22 @@ class MultiLevelCache:
         if self.disk_cache:
             try:
                 self.disk_cache.set(key, cache_item, expire=ttl or config.CACHE_TTL)
+            except Exception:
+                pass
+    
+    def delete(self, key: str):
+        if key in self.memory_cache:
+            del self.memory_cache[key]
+        
+        if self.redis_client:
+            try:
+                self.redis_client.delete(f"city:{key}")
+            except Exception:
+                pass
+        
+        if self.disk_cache:
+            try:
+                del self.disk_cache[key]
             except Exception:
                 pass
     
@@ -335,7 +349,6 @@ class IntelligentImageFetcher:
     def __init__(self):
         self.wikimedia_api = "https://commons.wikimedia.org/w/api.php"
         self.wikipedia_api = "https://en.wikipedia.org/w/api.php"
-        self.image_quality_scores = {}
         
     def calculate_image_quality(self, image_info: dict) -> int:
         score = 50
@@ -530,12 +543,68 @@ class IntelligentImageFetcher:
             logger.warning(f"Wikipedia image fetch failed for {page_title}: {e}")
             return []
     
+    def get_one_representative_image(self, city_name: str, page_title: str = None) -> Optional[Dict]:
+        """Get ONLY ONE representative image for city preview"""
+        cache_key = f"one_image:{city_name}:{page_title}"
+        
+        cached = cache.get(cache_key)
+        if cached:
+            return cached
+        
+        try:
+            # Try to get Wikipedia page image first (usually most representative)
+            if page_title:
+                params = {
+                    'action': 'query',
+                    'titles': page_title,
+                    'prop': 'pageimages',
+                    'pithumbsize': 1200,
+                    'format': 'json'
+                }
+                
+                data = request_handler.get_json_cached(
+                    self.wikipedia_api,
+                    params=params,
+                    cache_key=f"wiki_page_image:{page_title}",
+                    ttl=config.CACHE_TTL_IMAGES
+                )
+                
+                pages = data.get('query', {}).get('pages', {})
+                for page in pages.values():
+                    if 'thumbnail' in page:
+                        thumb = page['thumbnail']
+                        image = {
+                            'url': thumb['source'],
+                            'title': f'Representative image of {city_name}',
+                            'description': f'Featured image from Wikipedia',
+                            'source': 'wikipedia',
+                            'width': thumb.get('width'),
+                            'height': thumb.get('height'),
+                            'quality_score': 85,
+                            'page_url': f"https://en.wikipedia.org/wiki/{quote_plus(page_title)}"
+                        }
+                        cache.set(cache_key, image, config.CACHE_TTL_IMAGES)
+                        return image
+            
+            # If no Wikipedia image, try to get one good city image
+            all_images = self.get_images_for_city(city_name, page_title, limit=3)
+            if all_images:
+                # Pick the best quality image
+                best_image = max(all_images, key=lambda x: x.get('quality_score', 0))
+                cache.set(cache_key, best_image, config.CACHE_TTL_IMAGES)
+                return best_image
+                
+        except Exception as e:
+            logger.debug(f"Single image fetch failed: {e}")
+        
+        return None
+    
     def get_images_for_city(self, city_name: str, page_title: str = None, limit: int = None) -> List[Dict]:
         limit = limit or config.MAX_IMAGES_PER_REQUEST
         images = []
         seen_urls = set()
         
-        # Strategy 1: Try Wikipedia images
+        # Try Wikipedia images
         if len(images) < limit:
             try:
                 wiki_images = self.fetch_from_wikipedia(page_title or city_name, limit - len(images))
@@ -549,7 +618,7 @@ class IntelligentImageFetcher:
             except Exception as e:
                 logger.debug(f"Wikipedia images failed: {e}")
         
-        # Strategy 2: Try Wikimedia for cityscapes
+        # Try Wikimedia for cityscapes
         if len(images) < limit:
             try:
                 wikimedia_images = self.fetch_from_wikimedia(city_name, limit - len(images))
@@ -613,7 +682,7 @@ class IntelligentImageFetcher:
                 value = extmetadata[field].get('value', '')
                 if isinstance(value, str) and value.strip():
                     clean_value = re.sub(r'<[^>]+>', '', value)
-                    return clean_value  # NO TRUNCATION
+                    return clean_value
         
         return ""
 
@@ -632,9 +701,9 @@ class EnhancedCityDataProvider:
             extract_format=wikipediaapi.ExtractFormat.WIKI
         )
         self.map_provider = MapProvider()
-        self.city_coordinates_cache = {}
-        self.city_wiki_cache = {}
         self.stats = {
+            'previews_generated': 0,
+            'details_generated': 0,
             'coordinates_found': 0,
             'coordinates_failed': 0,
             'wiki_found': 0,
@@ -798,6 +867,48 @@ class EnhancedCityDataProvider:
         
         return None
     
+    def _get_short_description(self, city_name: str, country: str = None) -> Tuple[Optional[str], Optional[str]]:
+        """Get only 1-2 sentences for preview"""
+        cache_key = f"short_desc:{city_name}:{country}"
+        
+        cached = cache.get(cache_key)
+        if cached:
+            return cached.get('description'), cached.get('title')
+        
+        variations = self._generate_wiki_variations(city_name, country)
+        
+        for variation in variations:
+            try:
+                page = self.wiki.page(variation)
+                
+                if page.exists() and page.ns == 0:
+                    if self._is_city_page(page):
+                        summary = page.summary or ""
+                        if summary:
+                            # Get first 2 sentences max
+                            sentences = re.split(r'[.!?]', summary)
+                            short_desc = ""
+                            sentence_count = 0
+                            for sentence in sentences:
+                                if sentence.strip():
+                                    short_desc += sentence.strip() + '. '
+                                    sentence_count += 1
+                                    if sentence_count >= 2:
+                                        break
+                            
+                            short_desc = short_desc.strip()
+                            if short_desc:
+                                cache.set(cache_key, {
+                                    'description': short_desc,
+                                    'title': page.title
+                                }, config.CACHE_TTL_PREVIEW)
+                                return short_desc, page.title
+            except Exception as e:
+                logger.debug(f"Short description check failed: {e}")
+                continue
+        
+        return None, None
+    
     def get_wikipedia_data_enhanced(self, city_name: str, country: str = None) -> Tuple[Optional[Dict], Optional[str]]:
         cache_key = f"wiki:{city_name}:{country}"
         
@@ -884,12 +995,12 @@ class EnhancedCityDataProvider:
             text = (section.text or "").strip()
             
             if title and text and title not in ["See also", "References", "External links", "Notes", "Bibliography"]:
-                cleaned = clean_text(text)  # NO TRUNCATION
+                cleaned = clean_text(text)
                 
                 if cleaned:
                     sections.append({
                         "title": title,
-                        "content": cleaned,  # FULL CONTENT
+                        "content": cleaned,
                         "length": len(cleaned)
                     })
             
@@ -903,61 +1014,13 @@ class EnhancedCityDataProvider:
         
         return {
             'title': page.title,
-            'summary': full_summary,  # FULL SUMMARY, NO TRUNCATION
+            'summary': full_summary,
             'fullurl': getattr(page, 'fullurl', f"https://en.wikipedia.org/wiki/{quote_plus(page.title)}"),
             'sections': sections,
             'pageid': getattr(page, 'pageid', None),
             'text_length': len(full_summary),
             'sections_count': len(sections)
         }
-    
-    def extract_landmarks_from_wiki(self, wiki_data: Dict, city_name: str) -> List[str]:
-        """Extract landmark names from Wikipedia content"""
-        landmarks = []
-        
-        try:
-            if not wiki_data:
-                return landmarks
-            
-            summary = wiki_data.get('summary', '').lower()
-            
-            # Look for landmark mentions in summary
-            landmark_keywords = [
-                'cathedral', 'palace', 'museum', 'castle', 'temple', 
-                'mosque', 'church', 'tower', 'bridge', 'monument',
-                'statue', 'fountain', 'square', 'plaza', 'park',
-                'gardens', 'opera', 'theater', 'stadium', 'arena',
-                'landmark', 'attraction'
-            ]
-            
-            # Extract sentences containing landmark keywords
-            sentences = re.split(r'[.!?]', wiki_data.get('summary', ''))
-            for sentence in sentences[:20]:  # Check first 20 sentences
-                sentence_lower = sentence.lower()
-                if any(keyword in sentence_lower for keyword in landmark_keywords):
-                    # Extract proper nouns (capitalized words)
-                    words = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', sentence)
-                    for word in words:
-                        if len(word) > 3 and word.lower() != city_name.lower():
-                            landmarks.append(word)
-            
-            # Look in sections
-            for section in wiki_data.get('sections', []):
-                content = section.get('content', '').lower()
-                if any(keyword in content for keyword in ['landmark', 'attraction', 'tourist']):
-                    # Extract proper nouns from this section
-                    words = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', section.get('content', ''))
-                    for word in words[:10]:  # Limit to 10 per section
-                        if len(word) > 3 and word.lower() != city_name.lower():
-                            landmarks.append(word)
-            
-            # Remove duplicates and limit
-            unique_landmarks = list(dict.fromkeys(landmarks))
-            return unique_landmarks[:15]  # Return up to 15 landmarks
-            
-        except Exception as e:
-            logger.debug(f"Landmark extraction failed for {city_name}: {e}")
-            return []
     
     def get_city_tagline_enhanced(self, city_name: str, country: str = None) -> Dict[str, str]:
         cache_key = f"tagline:{city_name}:{country}"
@@ -967,10 +1030,9 @@ class EnhancedCityDataProvider:
             return cached
         
         try:
-            page_data, _ = self.get_wikipedia_data_enhanced(city_name, country)
-            if page_data and page_data.get('summary'):
+            summary, _ = self._get_short_description(city_name, country)
+            if summary:
                 # Use first sentence as tagline
-                summary = page_data['summary']
                 sentences = re.split(r'[.!?]', summary)
                 if sentences and sentences[0]:
                     tagline = sentences[0].strip()
@@ -991,188 +1053,144 @@ class EnhancedCityDataProvider:
         cache.set(cache_key, result, config.CACHE_TTL)
         return result
     
-    def get_city_preview_enhanced(self, city_name: str, country: str = None, 
+    def get_city_preview_minimal(self, city_name: str, country: str = None, 
                                  region: str = None) -> Dict:
-        cache_key = f"preview:{city_name}:{country}:{region}"
+        """MINIMAL preview for /api/cities - ONLY name, 1 image, short desc, coords, region"""
+        cache_key = f"minimal_preview:{city_name}:{country}:{region}"
         
         cached = cache.get(cache_key)
         if cached:
             return cached
         
-        logger.info(f"🔄 Generating preview for {city_name}")
+        self.stats['previews_generated'] += 1
+        logger.info(f"🔄 Generating MINIMAL preview for {city_name}")
         
+        # Start with absolute minimal structure
         preview = {
             "id": self._generate_city_id(city_name),
             "name": city_name,
             "display_name": city_name,
-            "summary": "Loading city information...",
-            "has_details": True,
-            "image": None,
-            "images": [],
+            "summary": "",  # Will be short description
+            "has_details": False,
+            "image": None,  # ONLY ONE image
+            "images": [],   # EMPTY - no images array
             "coordinates": None,
             "static_map": None,
             "tagline": None,
-            "tagline_source": "loading",
             "last_updated": time.time(),
             "country": country,
             "region": region,
-            "landmarks": [],
+            "landmarks": [],  # EMPTY - no landmarks in preview
             "metadata": {
-                "image_quality": "unknown",
-                "coordinate_accuracy": "unknown",
-                "data_completeness": 0
+                "data_type": "minimal_preview"
             }
         }
         
-        # Get Wikipedia data and coordinates in parallel
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            coordinates_future = executor.submit(
-                self.get_coordinates_enhanced, city_name, country, region
-            )
-            
-            wiki_future = executor.submit(
-                self.get_wikipedia_data_enhanced, city_name, country
-            )
-            
-            try:
-                coords_result = coordinates_future.result(timeout=10)
-                if coords_result:
-                    lat, lon, metadata = coords_result
-                    preview["coordinates"] = {"lat": lat, "lon": lon}
-                    preview["metadata"]["coordinate_accuracy"] = metadata.get('source', 'unknown')
-                    
-                    preview["static_map"] = self.map_provider.generate_static_map_url(
-                        {"lat": lat, "lon": lon}, width=400, height=250
-                    )
-            except Exception as e:
-                logger.warning(f"Coordinates fetch failed for {city_name}: {e}")
-            
-            try:
-                wiki_data, wiki_title = wiki_future.result(timeout=10)
-                if wiki_data:
-                    preview["display_name"] = wiki_data.get('title', city_name)
-                    preview["summary"] = wiki_data.get('summary', f"A city in {country or 'the world'}")  # FULL summary
-                    preview["has_details"] = True
-                    
-                    # Extract landmarks from Wikipedia data
-                    preview["landmarks"] = self.extract_landmarks_from_wiki(wiki_data, city_name)
-                    preview["_wiki_title"] = wiki_title or city_name
-                else:
-                    preview["has_details"] = False
-                    preview["summary"] = f"Discover {city_name}, a city in {country or 'the world'}"
-            except Exception as e:
-                logger.warning(f"Wikipedia fetch failed for {city_name}: {e}")
-                preview["has_details"] = False
+        # Get coordinates
+        try:
+            coords_result = self.get_coordinates_enhanced(city_name, country, region)
+            if coords_result:
+                lat, lon, metadata = coords_result
+                preview["coordinates"] = {"lat": lat, "lon": lon}
+                
+                # Generate static map
+                preview["static_map"] = self.map_provider.generate_static_map_url(
+                    {"lat": lat, "lon": lon}, width=400, height=250
+                )
+        except Exception as e:
+            logger.warning(f"Coordinates fetch failed for {city_name}: {e}")
         
-        # Get images
+        # Get short description
+        try:
+            short_desc, wiki_title = self._get_short_description(city_name, country)
+            if short_desc:
+                preview["display_name"] = wiki_title or city_name
+                preview["summary"] = short_desc
+                preview["_wiki_title"] = wiki_title or city_name
+            else:
+                preview["summary"] = f"Discover {city_name}, a city in {country or 'the world'}"
+        except Exception as e:
+            logger.warning(f"Description fetch failed for {city_name}: {e}")
+        
+        # Get ONE image only
         try:
             wiki_title = preview.get("_wiki_title", city_name)
-            images = image_fetcher.get_images_for_city(
-                city_name, 
-                wiki_title,
-                limit=min(3, config.MAX_IMAGES_PER_REQUEST)
-            )
+            image = image_fetcher.get_one_representative_image(city_name, wiki_title)
             
-            if images:
-                preview["images"] = images
-                preview["image"] = images[0]
-                
-                quality_scores = [img.get('quality_score', 0) for img in images]
-                avg_quality = sum(quality_scores) / len(quality_scores) if quality_scores else 0
-                
-                if avg_quality >= 70:
-                    preview["metadata"]["image_quality"] = "excellent"
-                elif avg_quality >= 50:
-                    preview["metadata"]["image_quality"] = "good"
-                elif avg_quality >= 30:
-                    preview["metadata"]["image_quality"] = "fair"
-                else:
-                    preview["metadata"]["image_quality"] = "basic"
-                
+            if image:
+                preview["image"] = image
                 self.stats['images_found'] += 1
             else:
-                logger.warning(f"No images found for {city_name}")
                 self.stats['images_failed'] += 1
+                # Add fallback image
+                fallback_image = image_fetcher.generate_fallback_image(city_name)
+                preview["image"] = fallback_image
                 
         except Exception as e:
             logger.error(f"Image fetch failed for {city_name}: {e}")
             self.stats['images_failed'] += 1
+            fallback_image = image_fetcher.generate_fallback_image(city_name)
+            preview["image"] = fallback_image
         
         # Get tagline
         try:
             tagline_data = self.get_city_tagline_enhanced(city_name, country)
             preview["tagline"] = tagline_data.get("tagline")
-            preview["tagline_source"] = tagline_data.get("source")
         except Exception as e:
             logger.debug(f"Tagline fetch failed: {e}")
             preview["tagline"] = f"Discover {city_name}"
-            preview["tagline_source"] = "default"
         
-        # Calculate data completeness
-        completeness_score = 0
-        if preview.get("coordinates"): completeness_score += 30
-        if preview.get("image"): completeness_score += 40
-        if preview.get("has_details"): completeness_score += 20
-        if preview.get("tagline"): completeness_score += 10
+        # Cache the minimal preview
+        cache.set(cache_key, preview, config.CACHE_TTL_PREVIEW)
         
-        preview["metadata"]["data_completeness"] = completeness_score
-        
-        # Ensure we have at least a placeholder image
-        if not preview.get("image"):
-            fallback_image = image_fetcher.generate_fallback_image(city_name)
-            preview["image"] = fallback_image
-            preview["images"] = [fallback_image]
-        
-        # Ensure we have a static map
-        if not preview.get("static_map"):
-            preview["static_map"] = self.map_provider.generate_static_map_url(
-                preview.get("coordinates"), width=400, height=250
-            )
-        
-        # Cache the result
-        cache.set(cache_key, preview, config.CACHE_TTL)
-        
-        logger.info(f"✅ Preview generated for {city_name} (completeness: {completeness_score}%)")
+        logger.info(f"✅ Minimal preview generated for {city_name}")
         return preview
     
     def get_city_details_enhanced(self, city_name: str, country: str = None, 
                                  region: str = None) -> Dict:
+        """FULL details for individual city page"""
         cache_key = f"details:{city_name}:{country}:{region}"
         
         cached = cache.get(cache_key)
         if cached:
+            self.stats['details_generated'] += 1
             return cached
         
-        logger.info(f"🔄 Generating detailed data for {city_name}")
+        self.stats['details_generated'] += 1
+        logger.info(f"🔄 Generating FULL details for {city_name}")
         
-        preview = self.get_city_preview_enhanced(city_name, country, region)
+        # Start with minimal preview data
+        preview = self.get_city_preview_minimal(city_name, country, region)
         
+        # Build full details
         details = {
             **preview,
             "detailed_summary": "",
             "sections": [],
-            "culture": {},
-            "transportation": {},
-            "best_time_to_visit": "",
             "sources": [],
             "map_config": {},
             "additional_images": [],
             "statistics": {},
-            "nearby_cities": []
+            "metadata": {
+                **preview.get("metadata", {}),
+                "data_type": "full_details",
+                "loaded_at": time.time()
+            }
         }
         
+        # Get full Wikipedia data
         wiki_data, wiki_title = self.get_wikipedia_data_enhanced(city_name, country)
         if wiki_data:
-            details["detailed_summary"] = wiki_data.get('summary', '')  # FULL DETAILED SUMMARY, NO TRUNCATION
+            details["detailed_summary"] = wiki_data.get('summary', '')
             details["sources"].append(wiki_data.get('fullurl', ''))
             
-            # Include ALL sections with FULL content
+            # Include sections
             sections_data = []
             for section in wiki_data.get('sections', []):
                 if section.get('content'):
                     sections_data.append({
                         "title": section.get('title'),
-                        "content": section.get('content')  # FULL CONTENT, NO TRUNCATION
+                        "content": section.get('content')
                     })
             details["sections"] = sections_data
         
@@ -1185,11 +1203,13 @@ class EnhancedCityDataProvider:
             )
             
             if additional_images:
+                # Update images array with all images
+                details["images"] = additional_images
+                # Keep first as main image
                 if additional_images and not details.get("image"):
                     details["image"] = additional_images[0]
-                
-                details["additional_images"] = additional_images[1:6]
-                details["images"] = additional_images
+                # Set additional_images to all but first
+                details["additional_images"] = additional_images[1:min(6, len(additional_images))]
         except Exception as e:
             logger.warning(f"Additional images failed for {city_name}: {e}")
         
@@ -1198,19 +1218,18 @@ class EnhancedCityDataProvider:
             details.get("coordinates")
         )
         
+        # Mark that details are loaded
+        details["has_details"] = True
+        
         details["statistics"] = {
             "image_count": len(details.get("images", [])),
             "section_count": len(details.get("sections", [])),
-            "landmark_count": len(details.get("landmarks", [])),
-            "data_quality": preview.get("metadata", {}).get("data_completeness", 0),
-            "last_updated": time.time(),
-            "text_length": len(details.get("detailed_summary", "")),
-            "total_content_length": sum(len(s.get('content', '')) for s in details.get("sections", []))
+            "last_updated": time.time()
         }
         
         cache.set(cache_key, details, config.CACHE_TTL)
         
-        logger.info(f"✅ Details generated for {city_name} (text length: {len(details.get('detailed_summary', ''))} chars)")
+        logger.info(f"✅ Details generated for {city_name}")
         return details
     
     def _generate_city_id(self, city_name: str) -> str:
@@ -1331,16 +1350,12 @@ class CityLoadingManager:
         self.loaded_cities = {}
         self.loading_status = {
             'total': 0,
-            'loaded': 0,
+            'previews_loaded': 0,
+            'details_loaded': 0,
             'failed': 0,
-            'with_images': 0,
-            'with_coordinates': 0,
             'start_time': None,
-            'estimated_completion': None
         }
         self.loading_queue = []
-        self.is_loading = False
-        self.loading_thread = None
         
     def initialize_with_world_cities(self, world_cities_data: List[Dict]):
         if not world_cities_data:
@@ -1349,10 +1364,9 @@ class CityLoadingManager:
         
         self.loading_status['total'] = len(world_cities_data)
         self.loading_status['start_time'] = time.time()
-        self.loading_status['loaded'] = 0
+        self.loading_status['previews_loaded'] = 0
+        self.loading_status['details_loaded'] = 0
         self.loading_status['failed'] = 0
-        self.loading_status['with_images'] = 0
-        self.loading_status['with_coordinates'] = 0
         
         self.loading_queue = []
         for city_data in world_cities_data:
@@ -1360,7 +1374,7 @@ class CityLoadingManager:
                 'name': city_data['name'],
                 'country': city_data.get('country'),
                 'region': city_data.get('region'),
-                'priority': 50  # Default priority for all cities
+                'priority': 50
             })
         
         self.loading_queue.sort(key=lambda x: x['priority'], reverse=True)
@@ -1368,35 +1382,10 @@ class CityLoadingManager:
         logger.info(f"📊 Initialized loading manager with {len(self.loading_queue)} cities")
     
     def get_loading_status(self):
-        if self.loading_status['start_time']:
-            elapsed = time.time() - self.loading_status['start_time']
-            if self.loading_status['loaded'] > 0:
-                estimated_total = elapsed * self.loading_status['total'] / self.loading_status['loaded']
-                remaining = max(0, estimated_total - elapsed)
-                self.loading_status['estimated_completion'] = remaining
-            else:
-                self.loading_status['estimated_completion'] = None
-        
         return self.loading_status
     
     def get_city(self, city_name: str) -> Optional[Dict]:
         return self.loaded_cities.get(city_name)
-    
-    def search_cities(self, query: str, limit: int = 20) -> List[Dict]:
-        if not query or len(query) < 2:
-            return []
-        
-        query_lower = query.lower()
-        results = []
-        
-        for city_name, city_data in self.loaded_cities.items():
-            if query_lower in city_name.lower():
-                results.append(city_data)
-            
-            if len(results) >= limit:
-                break
-        
-        return results
 
 # ==================== FLASK APP & ROUTES ====================
 app = Flask(__name__)
@@ -1414,7 +1403,7 @@ map_provider = MapProvider()
 city_loader = CityLoadingManager(data_provider)
 
 WORLD_CITIES = [
-    # EUROPE 
+    # EUROPE (Expanded - 200+ cities)
     {"name":"Paris","country":"France","region":"Europe"},
     {"name":"London","country":"United Kingdom","region":"Europe"},
     {"name":"Rome","country":"Italy","region":"Europe"},
@@ -1550,7 +1539,6 @@ WORLD_CITIES = [
     {"name":"St Moritz","country":"Switzerland","region":"Europe"},
     {"name":"Jungfrau Region","country":"Switzerland","region":"Europe"},
     {"name":"Lake Geneva","country":"Switzerland","region":"Europe"},
-    {"name":"Salzburg","country":"Austria","region":"Europe"},
     {"name":"Graz","country":"Austria","region":"Europe"},
     {"name":"Linz","country":"Austria","region":"Europe"},
     {"name":"Hallstatt","country":"Austria","region":"Europe"},
@@ -1579,8 +1567,329 @@ WORLD_CITIES = [
     {"name":"Heligoland","country":"Germany","region":"Europe"},
     {"name":"Baltic Coast","country":"Germany","region":"Europe"},
     {"name":"North Sea Coast","country":"Germany","region":"Europe"},
+    {"name":"San Sebastian","country":"Spain","region":"Europe"},
+    {"name":"Toledo","country":"Spain","region":"Europe"},
+    {"name":"Cordoba","country":"Spain","region":"Europe"},
+    {"name":"Malaga","country":"Spain","region":"Europe"},
+    {"name":"Marbella","country":"Spain","region":"Europe"},
+    {"name":"Ibiza","country":"Spain","region":"Europe"},
+    {"name":"Mallorca","country":"Spain","region":"Europe"},
+    {"name":"Tenerife","country":"Spain","region":"Europe"},
+    {"name":"Gran Canaria","country":"Spain","region":"Europe"},
+    {"name":"Lanzarote","country":"Spain","region":"Europe"},
+    {"name":"Fuerteventura","country":"Spain","region":"Europe"},
+    {"name":"Menorca","country":"Spain","region":"Europe"},
+    {"name":"Ronda","country":"Spain","region":"Europe"},
+    {"name":"Salamanca","country":"Spain","region":"Europe"},
+    {"name":"Avila","country":"Spain","region":"Europe"},
+    {"name":"Segovia","country":"Spain","region":"Europe"},
+    {"name":"Girona","country":"Spain","region":"Europe"},
+    {"name":"Tarragona","country":"Spain","region":"Europe"},
+    {"name":"Santiago de Compostela","country":"Spain","region":"Europe"},
+    {"name":"Toulouse","country":"France","region":"Europe"},
+    {"name":"Lille","country":"France","region":"Europe"},
+    {"name":"Nantes","country":"France","region":"Europe"},
+    {"name":"Rennes","country":"France","region":"Europe"},
+    {"name":"Montpellier","country":"France","region":"Europe"},
+    {"name":"Toulon","country":"France","region":"Europe"},
+    {"name":"Avignon","country":"France","region":"Europe"},
+    {"name":"Arles","country":"France","region":"Europe"},
+    {"name":"Aix-en-Provence","country":"France","region":"Europe"},
+    {"name":"Tours","country":"France","region":"Europe"},
+    {"name":"Colmar","country":"France","region":"Europe"},
+    {"name":"Annecy","country":"France","region":"Europe"},
+    {"name":"Chamonix","country":"France","region":"Europe"},
+    {"name":"Biarritz","country":"France","region":"Europe"},
+    {"name":"La Rochelle","country":"France","region":"Europe"},
+    {"name":"St Malo","country":"France","region":"Europe"},
+    {"name":"Deauville","country":"France","region":"Europe"},
+    {"name":"Honfleur","country":"France","region":"Europe"},
+    {"name":"Etretat","country":"France","region":"Europe"},
+    {"name":"Bergamo","country":"Italy","region":"Europe"},
+    {"name":"Brescia","country":"Italy","region":"Europe"},
+    {"name":"Modena","country":"Italy","region":"Europe"},
+    {"name":"Parma","country":"Italy","region":"Europe"},
+    {"name":"Reggio Emilia","country":"Italy","region":"Europe"},
+    {"name":"Ravenna","country":"Italy","region":"Europe"},
+    {"name":"Ferrara","country":"Italy","region":"Europe"},
+    {"name":"Bari","country":"Italy","region":"Europe"},
+    {"name":"Lecce","country":"Italy","region":"Europe"},
+    {"name":"Brindisi","country":"Italy","region":"Europe"},
+    {"name":"Taranto","country":"Italy","region":"Europe"},
+    {"name":"Catania","country":"Italy","region":"Europe"},
+    {"name":"Syracuse","country":"Italy","region":"Europe"},
+    {"name":"Taormina","country":"Italy","region":"Europe"},
+    {"name":"Cagliari","country":"Italy","region":"Europe"},
+    {"name":"Olbia","country":"Italy","region":"Europe"},
+    {"name":"Alghero","country":"Italy","region":"Europe"},
+    {"name":"Trento","country":"Italy","region":"Europe"},
+    {"name":"Bolzano","country":"Italy","region":"Europe"},
+    {"name":"Aosta","country":"Italy","region":"Europe"},
+    {"name":"Perugia","country":"Italy","region":"Europe"},
+    {"name":"Assisi","country":"Italy","region":"Europe"},
+    {"name":"Orvieto","country":"Italy","region":"Europe"},
+    {"name":"Spoleto","country":"Italy","region":"Europe"},
+    {"name":"Tivoli","country":"Italy","region":"Europe"},
+    {"name":"Pompeii","country":"Italy","region":"Europe"},
+    {"name":"Herculaneum","country":"Italy","region":"Europe"},
+    {"name":"Capri","country":"Italy","region":"Europe"},
+    {"name":"Ischia","country":"Italy","region":"Europe"},
+    {"name":"Elba","country":"Italy","region":"Europe"},
+    {"name":"Lake Maggiore","country":"Italy","region":"Europe"},
+    {"name":"Lake Orta","country":"Italy","region":"Europe"},
+    {"name":"Lake Iseo","country":"Italy","region":"Europe"},
 
-    # NORTH AMERICA
+    # MOROCCO (Expanded as requested - 50+ cities)
+    {"name":"Marrakech","country":"Morocco","region":"Africa"},
+    {"name":"Casablanca","country":"Morocco","region":"Africa"},
+    {"name":"Fez","country":"Morocco","region":"Africa"},
+    {"name":"Tangier","country":"Morocco","region":"Africa"},
+    {"name":"Rabat","country":"Morocco","region":"Africa"},
+    {"name":"Essaouira","country":"Morocco","region":"Africa"},
+    {"name":"Chefchaouen","country":"Morocco","region":"Africa"},
+    {"name":"Agadir","country":"Morocco","region":"Africa"},
+    {"name":"Ouarzazate","country":"Morocco","region":"Africa"},
+    {"name":"Meknes","country":"Morocco","region":"Africa"},
+    {"name":"Tetouan","country":"Morocco","region":"Africa"},
+    {"name":"El Jadida","country":"Morocco","region":"Africa"},
+    {"name":"Safi","country":"Morocco","region":"Africa"},
+    {"name":"Kenitra","country":"Morocco","region":"Africa"},
+    {"name":"Nador","country":"Morocco","region":"Africa"},
+    {"name":"Settat","country":"Morocco","region":"Africa"},
+    {"name":"Mohammedia","country":"Morocco","region":"Africa"},
+    {"name":"Khouribga","country":"Morocco","region":"Africa"},
+    {"name":"Beni Mellal","country":"Morocco","region":"Africa"},
+    {"name":"Taza","country":"Morocco","region":"Africa"},
+    {"name":"Al Hoceima","country":"Morocco","region":"Africa"},
+    {"name":"Larache","country":"Morocco","region":"Africa"},
+    {"name":"Ksar El Kebir","country":"Morocco","region":"Africa"},
+    {"name":"Guelmim","country":"Morocco","region":"Africa"},
+    {"name":"Errachidia","country":"Morocco","region":"Africa"},
+    {"name":"Taroudant","country":"Morocco","region":"Africa"},
+    {"name":"Sidi Ifni","country":"Morocco","region":"Africa"},
+    {"name":"Midelt","country":"Morocco","region":"Africa"},
+    {"name":"Azrou","country":"Morocco","region":"Africa"},
+    {"name":"Ifrane","country":"Morocco","region":"Africa"},
+    {"name":"Moulay Idriss","country":"Morocco","region":"Africa"},
+    {"name":"Volubilis","country":"Morocco","region":"Africa"},
+    {"name":"Ait Benhaddou","country":"Morocco","region":"Africa"},
+    {"name":"Merzouga","country":"Morocco","region":"Africa"},
+    {"name":"Zagora","country":"Morocco","region":"Africa"},
+    {"name":"Tinghir","country":"Morocco","region":"Africa"},
+    {"name":"Dakhla","country":"Morocco","region":"Africa"},
+    {"name":"Laayoune","country":"Morocco","region":"Africa"},
+    {"name":"Smara","country":"Morocco","region":"Africa"},
+    {"name":"Asilah","country":"Morocco","region":"Africa"},
+    {"name":"M'diq","country":"Morocco","region":"Africa"},
+    {"name":"Fnideq","country":"Morocco","region":"Africa"},
+    {"name":"Martil","country":"Morocco","region":"Africa"},
+    {"name":"Bouznika","country":"Morocco","region":"Africa"},
+    {"name":"Temara","country":"Morocco","region":"Africa"},
+    {"name":"Skhirat","country":"Morocco","region":"Africa"},
+    {"name":"Benslimane","country":"Morocco","region":"Africa"},
+    {"name":"Berrechid","country":"Morocco","region":"Africa"},
+    {"name":"Youssoufia","country":"Morocco","region":"Africa"},
+    {"name":"Oujda","country":"Morocco","region":"Africa"},
+    {"name":"Taourirt","country":"Morocco","region":"Africa"},
+    {"name":"Jerada","country":"Morocco","region":"Africa"},
+    {"name":"Figuig","country":"Morocco","region":"Africa"},
+    {"name":"Berkane","country":"Morocco","region":"Africa"},
+    {"name":"Nador","country":"Morocco","region":"Africa"},
+    {"name":"Al Hoceima","country":"Morocco","region":"Africa"},
+    {"name":"Taza","country":"Morocco","region":"Africa"},
+    {"name":"Sefrou","country":"Morocco","region":"Africa"},
+    {"name":"Boulemane","country":"Morocco","region":"Africa"},
+    {"name":"Midelt","country":"Morocco","region":"Africa"},
+    {"name":"Errachidia","country":"Morocco","region":"Africa"},
+    {"name":"Goulmima","country":"Morocco","region":"Africa"},
+    {"name":"Rissani","country":"Morocco","region":"Africa"},
+    {"name":"Merzouga","country":"Morocco","region":"Africa"},
+    {"name":"Tineghir","country":"Morocco","region":"Africa"},
+    {"name":"Todgha Gorge","country":"Morocco","region":"Africa"},
+    {"name":"Dades Valley","country":"Morocco","region":"Africa"},
+    {"name":"Skoura","country":"Morocco","region":"Africa"},
+    {"name":"Kelaa Mgouna","country":"Morocco","region":"Africa"},
+    {"name":"Taliouine","country":"Morocco","region":"Africa"},
+    {"name":"Tafraoute","country":"Morocco","region":"Africa"},
+    {"name":"Mirleft","country":"Morocco","region":"Africa"},
+    {"name":"Sidi Kaouki","country":"Morocco","region":"Africa"},
+    {"name":"Taghazout","country":"Morocco","region":"Africa"},
+    {"name":"Tamraght","country":"Morocco","region":"Africa"},
+    {"name":"Imsouane","country":"Morocco","region":"Africa"},
+
+    # MIDDLE EAST (Expanded as requested - 100+ cities, NO ISRAELI CITIES)
+    {"name":"Dubai","country":"United Arab Emirates","region":"Middle East"},
+    {"name":"Abu Dhabi","country":"United Arab Emirates","region":"Middle East"},
+    {"name":"Sharjah","country":"United Arab Emirates","region":"Middle East"},
+    {"name":"Ras Al Khaimah","country":"United Arab Emirates","region":"Middle East"},
+    {"name":"Fujairah","country":"United Arab Emirates","region":"Middle East"},
+    {"name":"Ajman","country":"United Arab Emirates","region":"Middle East"},
+    {"name":"Umm Al Quwain","country":"United Arab Emirates","region":"Middle East"},
+    {"name":"Al Ain","country":"United Arab Emirates","region":"Middle East"},
+    {"name":"Dibba","country":"United Arab Emirates","region":"Middle East"},
+    {"name":"Khor Fakkan","country":"United Arab Emirates","region":"Middle East"},
+    {"name":"Doha","country":"Qatar","region":"Middle East"},
+    {"name":"Al Wakrah","country":"Qatar","region":"Middle East"},
+    {"name":"Al Khor","country":"Qatar","region":"Middle East"},
+    {"name":"Al Rayyan","country":"Qatar","region":"Middle East"},
+    {"name":"Umm Salal","country":"Qatar","region":"Middle East"},
+    {"name":"Madinat ash Shamal","country":"Qatar","region":"Middle East"},
+    {"name":"Manama","country":"Bahrain","region":"Middle East"},
+    {"name":"Muharraq","country":"Bahrain","region":"Middle East"},
+    {"name":"Riffa","country":"Bahrain","region":"Middle East"},
+    {"name":"Hamad Town","country":"Bahrain","region":"Middle East"},
+    {"name":"Isa Town","country":"Bahrain","region":"Middle East"},
+    {"name":"Sitra","country":"Bahrain","region":"Middle East"},
+    {"name":"Budaiya","country":"Bahrain","region":"Middle East"},
+    {"name":"Jidhafs","country":"Bahrain","region":"Middle East"},
+    {"name":"Kuwait City","country":"Kuwait","region":"Middle East"},
+    {"name":"Hawalli","country":"Kuwait","region":"Middle East"},
+    {"name":"Farwaniya","country":"Kuwait","region":"Middle East"},
+    {"name":"Jahra","country":"Kuwait","region":"Middle East"},
+    {"name":"Ahmadi","country":"Kuwait","region":"Middle East"},
+    {"name":"Salmiya","country":"Kuwait","region":"Middle East"},
+    {"name":"Muscat","country":"Oman","region":"Middle East"},
+    {"name":"Salalah","country":"Oman","region":"Middle East"},
+    {"name":"Sohar","country":"Oman","region":"Middle East"},
+    {"name":"Sur","country":"Oman","region":"Middle East"},
+    {"name":"Nizwa","country":"Oman","region":"Middle East"},
+    {"name":"Ibri","country":"Oman","region":"Middle East"},
+    {"name":"Rustaq","country":"Oman","region":"Middle East"},
+    {"name":"Bahla","country":"Oman","region":"Middle East"},
+    {"name":"Barka","country":"Oman","region":"Middle East"},
+    {"name":"Khasab","country":"Oman","region":"Middle East"},
+    {"name":"Duqm","country":"Oman","region":"Middle East"},
+    {"name":"Seeb","country":"Oman","region":"Middle East"},
+    {"name":"Al Buraimi","country":"Oman","region":"Middle East"},
+    {"name":"Riyadh","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Jeddah","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Mecca","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Medina","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Dammam","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Khobar","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Taif","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Tabuk","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Abha","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Jizan","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Najran","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Hail","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Buraidah","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Khamis Mushait","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Al Hofuf","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Al Jubail","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Yanbu","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Unaizah","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Arar","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Sakakah","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Jubail","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Dhahran","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Qatif","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Al Bahah","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Tarut","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Safwa","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Ras Tanura","country":"Saudi Arabia","region":"Middle East"},
+    {"name":"Sana'a","country":"Yemen","region":"Middle East"},
+    {"name":"Aden","country":"Yemen","region":"Middle East"},
+    {"name":"Taiz","country":"Yemen","region":"Middle East"},
+    {"name":"Hodeidah","country":"Yemen","region":"Middle East"},
+    {"name":"Ibb","country":"Yemen","region":"Middle East"},
+    {"name":"Dhamar","country":"Yemen","region":"Middle East"},
+    {"name":"Al Mukalla","country":"Yemen","region":"Middle East"},
+    {"name":"Zinjibar","country":"Yemen","region":"Middle East"},
+    {"name":"Sayyan","country":"Yemen","region":"Middle East"},
+    {"name":"Sadah","country":"Yemen","region":"Middle East"},
+    {"name":"Tehran","country":"Iran","region":"Middle East"},
+    {"name":"Mashhad","country":"Iran","region":"Middle East"},
+    {"name":"Isfahan","country":"Iran","region":"Middle East"},
+    {"name":"Shiraz","country":"Iran","region":"Middle East"},
+    {"name":"Tabriz","country":"Iran","region":"Middle East"},
+    {"name":"Yazd","country":"Iran","region":"Middle East"},
+    {"name":"Karaj","country":"Iran","region":"Middle East"},
+    {"name":"Qom","country":"Iran","region":"Middle East"},
+    {"name":"Ahvaz","country":"Iran","region":"Middle East"},
+    {"name":"Kermanshah","country":"Iran","region":"Middle East"},
+    {"name":"Rasht","country":"Iran","region":"Middle East"},
+    {"name":"Kashan","country":"Iran","region":"Middle East"},
+    {"name":"Hamadan","country":"Iran","region":"Middle East"},
+    {"name":"Ardabil","country":"Iran","region":"Middle East"},
+    {"name":"Bandar Abbas","country":"Iran","region":"Middle East"},
+    {"name":"Arak","country":"Iran","region":"Middle East"},
+    {"name":"Zahedan","country":"Iran","region":"Middle East"},
+    {"name":"Sanandaj","country":"Iran","region":"Middle East"},
+    {"name":"Qazvin","country":"Iran","region":"Middle East"},
+    {"name":"Khorramabad","country":"Iran","region":"Middle East"},
+    {"name":"Gorgan","country":"Iran","region":"Middle East"},
+    {"name":"Sari","country":"Iran","region":"Middle East"},
+    {"name":"Baghdad","country":"Iraq","region":"Middle East"},
+    {"name":"Basra","country":"Iraq","region":"Middle East"},
+    {"name":"Erbil","country":"Iraq","region":"Middle East"},
+    {"name":"Mosul","country":"Iraq","region":"Middle East"},
+    {"name":"Najaf","country":"Iraq","region":"Middle East"},
+    {"name":"Karbala","country":"Iraq","region":"Middle East"},
+    {"name":"Sulaymaniyah","country":"Iraq","region":"Middle East"},
+    {"name":"Kirkuk","country":"Iraq","region":"Middle East"},
+    {"name":"Nasiriyah","country":"Iraq","region":"Middle East"},
+    {"name":"Amara","country":"Iraq","region":"Middle East"},
+    {"name":"Ramadi","country":"Iraq","region":"Middle East"},
+    {"name":"Fallujah","country":"Iraq","region":"Middle East"},
+    {"name":"Hilla","country":"Iraq","region":"Middle East"},
+    {"name":"Dahuk","country":"Iraq","region":"Middle East"},
+    {"name":"Samarra","country":"Iraq","region":"Middle East"},
+    {"name":"Amman","country":"Jordan","region":"Middle East"},
+    {"name":"Petra","country":"Jordan","region":"Middle East"},
+    {"name":"Aqaba","country":"Jordan","region":"Middle East"},
+    {"name":"Jerash","country":"Jordan","region":"Middle East"},
+    {"name":"Wadi Rum","country":"Jordan","region":"Middle East"},
+    {"name":"Irbid","country":"Jordan","region":"Middle East"},
+    {"name":"Zarqa","country":"Jordan","region":"Middle East"},
+    {"name":"Madaba","country":"Jordan","region":"Middle East"},
+    {"name":"Karak","country":"Jordan","region":"Middle East"},
+    {"name":"Mafraq","country":"Jordan","region":"Middle East"},
+    {"name":"Salt","country":"Jordan","region":"Middle East"},
+    {"name":"Ajloun","country":"Jordan","region":"Middle East"},
+    {"name":"Tafilah","country":"Jordan","region":"Middle East"},
+    {"name":"Ma'an","country":"Jordan","region":"Middle East"},
+    {"name":"Beirut","country":"Lebanon","region":"Middle East"},
+    {"name":"Byblos","country":"Lebanon","region":"Middle East"},
+    {"name":"Baalbek","country":"Lebanon","region":"Middle East"},
+    {"name":"Tripoli","country":"Lebanon","region":"Middle East"},
+    {"name":"Sidon","country":"Lebanon","region":"Middle East"},
+    {"name":"Tyre","country":"Lebanon","region":"Middle East"},
+    {"name":"Jounieh","country":"Lebanon","region":"Middle East"},
+    {"name":"Zahle","country":"Lebanon","region":"Middle East"},
+    {"name":"Batroun","country":"Lebanon","region":"Middle East"},
+    {"name":"Jbeil","country":"Lebanon","region":"Middle East"},
+    {"name":"Aley","country":"Lebanon","region":"Middle East"},
+    {"name":"Bcharre","country":"Lebanon","region":"Middle East"},
+    {"name":"Damascus","country":"Syria","region":"Middle East"},
+    {"name":"Aleppo","country":"Syria","region":"Middle East"},
+    {"name":"Palmyra","country":"Syria","region":"Middle East"},
+    {"name":"Homs","country":"Syria","region":"Middle East"},
+    {"name":"Latakia","country":"Syria","region":"Middle East"},
+    {"name":"Hama","country":"Syria","region":"Middle East"},
+    {"name":"Raqqa","country":"Syria","region":"Middle East"},
+    {"name":"Deir ez-Zor","country":"Syria","region":"Middle East"},
+    {"name":"Idlib","country":"Syria","region":"Middle East"},
+    {"name":"Daraa","country":"Syria","region":"Middle East"},
+    {"name":"Tartus","country":"Syria","region":"Middle East"},
+    {"name":"Al-Hasakah","country":"Syria","region":"Middle East"},
+    {"name":"Qamishli","country":"Syria","region":"Middle East"},
+    {"name":"Manbij","country":"Syria","region":"Middle East"},
+    {"name":"Bethlehem","country":"Palestine","region":"Middle East"},
+    {"name":"Ramallah","country":"Palestine","region":"Middle East"},
+    {"name":"Gaza","country":"Palestine","region":"Middle East"},
+    {"name":"Jericho","country":"Palestine","region":"Middle East"},
+    {"name":"Hebron","country":"Palestine","region":"Middle East"},
+    {"name":"Nablus","country":"Palestine","region":"Middle East"},
+    {"name":"Jenin","country":"Palestine","region":"Middle East"},
+    {"name":"Tulkarm","country":"Palestine","region":"Middle East"},
+    {"name":"Qalqilya","country":"Palestine","region":"Middle East"},
+    {"name":"Salfit","country":"Palestine","region":"Middle East"},
+    {"name":"Tubas","country":"Palestine","region":"Middle East"},
+    {"name":"Khan Yunis","country":"Palestine","region":"Middle East"},
+    {"name":"Rafah","country":"Palestine","region":"Middle East"},
+
+    # NORTH AMERICA (200+ cities)
     {"name":"New York City","country":"USA","region":"North America"},
     {"name":"Los Angeles","country":"USA","region":"North America"},
     {"name":"Chicago","country":"USA","region":"North America"},
@@ -1694,8 +2003,24 @@ WORLD_CITIES = [
     {"name":"Antigua Guatemala","country":"Guatemala","region":"North America"},
     {"name":"Panama City","country":"Panama","region":"North America"},
     {"name":"Bocas del Toro","country":"Panama","region":"North America"},
+    {"name":"David","country":"Panama","region":"North America"},
+    {"name":"Colon","country":"Panama","region":"North America"},
+    {"name":"Port-au-Prince","country":"Haiti","region":"North America"},
+    {"name":"Cap-Haitien","country":"Haiti","region":"North America"},
+    {"name":"Jacmel","country":"Haiti","region":"North America"},
+    {"name":"Roseau","country":"Dominica","region":"North America"},
+    {"name":"Basse-Terre","country":"Guadeloupe","region":"North America"},
+    {"name":"Fort-de-France","country":"Martinique","region":"North America"},
+    {"name":"Providenciales","country":"Turks and Caicos","region":"North America"},
+    {"name":"George Town","country":"Cayman Islands","region":"North America"},
+    {"name":"Hamilton","country":"Bermuda","region":"North America"},
+    {"name":"Nuuk","country":"Greenland","region":"North America"},
+    {"name":"Ilulissat","country":"Greenland","region":"North America"},
+    {"name":"Kangerlussuaq","country":"Greenland","region":"North America"},
+    {"name":"Torshavn","country":"Faroe Islands","region":"North America"},
+    {"name":"St Pierre","country":"St Pierre and Miquelon","region":"North America"},
 
-    # SOUTH AMERICA
+    # SOUTH AMERICA (150+ cities)
     {"name":"Rio de Janeiro","country":"Brazil","region":"South America"},
     {"name":"Sao Paulo","country":"Brazil","region":"South America"},
     {"name":"Buenos Aires","country":"Argentina","region":"South America"},
@@ -1756,8 +2081,72 @@ WORLD_CITIES = [
     {"name":"Devil's Island","country":"French Guiana","region":"South America"},
     {"name":"Kaieteur Falls","country":"Guyana","region":"South America"},
     {"name":"Paramaribo","country":"Suriname","region":"South America"},
+    {"name":"Curitiba","country":"Brazil","region":"South America"},
+    {"name":"Porto Alegre","country":"Brazil","region":"South America"},
+    {"name":"Belém","country":"Brazil","region":"South America"},
+    {"name":"Goiania","country":"Brazil","region":"South America"},
+    {"name":"Campinas","country":"Brazil","region":"South America"},
+    {"name":"Natal","country":"Brazil","region":"South America"},
+    {"name":"Joao Pessoa","country":"Brazil","region":"South America"},
+    {"name":"Maceio","country":"Brazil","region":"South America"},
+    {"name":"Aracaju","country":"Brazil","region":"South America"},
+    {"name":"Vitoria","country":"Brazil","region":"South America"},
+    {"name":"Cuiaba","country":"Brazil","region":"South America"},
+    {"name":"Campo Grande","country":"Brazil","region":"South America"},
+    {"name":"Teresina","country":"Brazil","region":"South America"},
+    {"name":"Sao Luis","country":"Brazil","region":"South America"},
+    {"name":"Palmas","country":"Brazil","region":"South America"},
+    {"name":"Boa Vista","country":"Brazil","region":"South America"},
+    {"name":"Porto Velho","country":"Brazil","region":"South America"},
+    {"name":"Rio Branco","country":"Brazil","region":"South America"},
+    {"name":"Macapa","country":"Brazil","region":"South America"},
+    {"name":"Rosario","country":"Argentina","region":"South America"},
+    {"name":"La Plata","country":"Argentina","region":"South America"},
+    {"name":"Mar del Plata","country":"Argentina","region":"South America"},
+    {"name":"San Juan","country":"Argentina","region":"South America"},
+    {"name":"San Luis","country":"Argentina","region":"South America"},
+    {"name":"Neuquen","country":"Argentina","region":"South America"},
+    {"name":"Comodoro Rivadavia","country":"Argentina","region":"South America"},
+    {"name":"Rio Gallegos","country":"Argentina","region":"South America"},
+    {"name":"Formosa","country":"Argentina","region":"South America"},
+    {"name":"Resistencia","country":"Argentina","region":"South America"},
+    {"name":"Posadas","country":"Argentina","region":"South America"},
+    {"name":"Corrientes","country":"Argentina","region":"South America"},
+    {"name":"Parana","country":"Argentina","region":"South America"},
+    {"name":"Santa Fe","country":"Argentina","region":"South America"},
+    {"name":"Mendoza","country":"Argentina","region":"South America"},
+    {"name":"San Rafael","country":"Argentina","region":"South America"},
+    {"name":"Malargue","country":"Argentina","region":"South America"},
+    {"name":"Bariloche","country":"Argentina","region":"South America"},
+    {"name":"San Martin de los Andes","country":"Argentina","region":"South America"},
+    {"name":"Villa La Angostura","country":"Argentina","region":"South America"},
+    {"name":"El Calafate","country":"Argentina","region":"South America"},
+    {"name":"El Chalten","country":"Argentina","region":"South America"},
+    {"name":"Puerto Madryn","country":"Argentina","region":"South America"},
+    {"name":"Trelew","country":"Argentina","region":"South America"},
+    {"name":"Rawson","country":"Argentina","region":"South America"},
+    {"name":"Comodoro Rivadavia","country":"Argentina","region":"South America"},
+    {"name":"Rio Grande","country":"Argentina","region":"South America"},
+    {"name":"Ushuaia","country":"Argentina","region":"South America"},
+    {"name":"Tolhuin","country":"Argentina","region":"South America"},
+    {"name":"Caleta Olivia","country":"Argentina","region":"South America"},
+    {"name":"Puerto Deseado","country":"Argentina","region":"South America"},
+    {"name":"San Julian","country":"Argentina","region":"South America"},
+    {"name":"Puerto San Julian","country":"Argentina","region":"South America"},
+    {"name":"Gobernador Gregores","country":"Argentina","region":"South America"},
+    {"name":"Perito Moreno","country":"Argentina","region":"South America"},
+    {"name":"Los Antiguos","country":"Argentina","region":"South America"},
+    {"name":"Chile Chico","country":"Chile","region":"South America"},
+    {"name":"Coyhaique","country":"Chile","region":"South America"},
+    {"name":"Puerto Aysen","country":"Chile","region":"South America"},
+    {"name":"Puerto Chacabuco","country":"Chile","region":"South America"},
+    {"name":"Puerto Natales","country":"Chile","region":"South America"},
+    {"name":"Punta Arenas","country":"Chile","region":"South America"},
+    {"name":"Porvenir","country":"Chile","region":"South America"},
+    {"name":"Puerto Williams","country":"Chile","region":"South America"},
+    {"name":"Ushuaia","country":"Argentina","region":"South America"},
 
-    # ASIA
+    # ASIA (250+ cities)
     {"name":"Tokyo","country":"Japan","region":"Asia"},
     {"name":"Kyoto","country":"Japan","region":"Asia"},
     {"name":"Osaka","country":"Japan","region":"Asia"},
@@ -1902,48 +2291,7 @@ WORLD_CITIES = [
     {"name":"Fairy Meadows","country":"Pakistan","region":"Asia"},
     {"name":"Kashmir","country":"Pakistan","region":"Asia"},
 
-    # MIDDLE EAST
-    {"name":"Dubai","country":"United Arab Emirates","region":"Middle East"},
-    {"name":"Abu Dhabi","country":"United Arab Emirates","region":"Middle East"},
-    {"name":"Sharjah","country":"United Arab Emirates","region":"Middle East"},
-    {"name":"Ras Al Khaimah","country":"United Arab Emirates","region":"Middle East"},
-    {"name":"Doha","country":"Qatar","region":"Middle East"},
-    {"name":"Manama","country":"Bahrain","region":"Middle East"},
-    {"name":"Kuwait City","country":"Kuwait","region":"Middle East"},
-    {"name":"Muscat","country":"Oman","region":"Middle East"},
-    {"name":"Salalah","country":"Oman","region":"Middle East"},
-    {"name":"Riyadh","country":"Saudi Arabia","region":"Middle East"},
-    {"name":"Jeddah","country":"Saudi Arabia","region":"Middle East"},
-    {"name":"Mecca","country":"Saudi Arabia","region":"Middle East"},
-    {"name":"Medina","country":"Saudi Arabia","region":"Middle East"},
-    {"name":"Dammam","country":"Saudi Arabia","region":"Middle East"},
-    {"name":"Sana'a","country":"Yemen","region":"Middle East"},
-    {"name":"Aden","country":"Yemen","region":"Middle East"},
-    {"name":"Tehran","country":"Iran","region":"Middle East"},
-    {"name":"Mashhad","country":"Iran","region":"Middle East"},
-    {"name":"Isfahan","country":"Iran","region":"Middle East"},
-    {"name":"Shiraz","country":"Iran","region":"Middle East"},
-    {"name":"Tabriz","country":"Iran","region":"Middle East"},
-    {"name":"Yazd","country":"Iran","region":"Middle East"},
-    {"name":"Baghdad","country":"Iraq","region":"Middle East"},
-    {"name":"Basra","country":"Iraq","region":"Middle East"},
-    {"name":"Erbil","country":"Iraq","region":"Middle East"},
-    {"name":"Amman","country":"Jordan","region":"Middle East"},
-    {"name":"Petra","country":"Jordan","region":"Middle East"},
-    {"name":"Aqaba","country":"Jordan","region":"Middle East"},
-    {"name":"Jerash","country":"Jordan","region":"Middle East"},
-    {"name":"Wadi Rum","country":"Jordan","region":"Middle East"},
-    {"name":"Beirut","country":"Lebanon","region":"Middle East"},
-    {"name":"Byblos","country":"Lebanon","region":"Middle East"},
-    {"name":"Baalbek","country":"Lebanon","region":"Middle East"},
-    {"name":"Damascus","country":"Syria","region":"Middle East"},
-    {"name":"Aleppo","country":"Syria","region":"Middle East"},
-    {"name":"Palmyra","country":"Syria","region":"Middle East"},
-    {"name":"Bethlehem","country":"Palestine","region":"Middle East"},
-    {"name":"Ramallah","country":"Palestine","region":"Middle East"},
-    {"name":"Gaza","country":"Palestine","region":"Middle East"},
-
-    # AFRICA
+    # AFRICA (200+ cities)
     {"name":"Cape Town","country":"South Africa","region":"Africa"},
     {"name":"Johannesburg","country":"South Africa","region":"Africa"},
     {"name":"Durban","country":"South Africa","region":"Africa"},
@@ -1954,14 +2302,6 @@ WORLD_CITIES = [
     {"name":"Garden Route","country":"South Africa","region":"Africa"},
     {"name":"Winelands","country":"South Africa","region":"Africa"},
     {"name":"Sun City","country":"South Africa","region":"Africa"},
-    {"name":"Marrakech","country":"Morocco","region":"Africa"},
-    {"name":"Casablanca","country":"Morocco","region":"Africa"},
-    {"name":"Fez","country":"Morocco","region":"Africa"},
-    {"name":"Tangier","country":"Morocco","region":"Africa"},
-    {"name":"Rabat","country":"Morocco","region":"Africa"},
-    {"name":"Essaouira","country":"Morocco","region":"Africa"},
-    {"name":"Chefchaouen","country":"Morocco","region":"Africa"},
-    {"name":"Agadir","country":"Morocco","region":"Africa"},
     {"name":"Cairo","country":"Egypt","region":"Africa"},
     {"name":"Alexandria","country":"Egypt","region":"Africa"},
     {"name":"Luxor","country":"Egypt","region":"Africa"},
@@ -2055,8 +2395,62 @@ WORLD_CITIES = [
     {"name":"Victoria","country":"Seychelles","region":"Africa"},
     {"name":"Comoros","country":"Comoros","region":"Africa"},
     {"name":"Moroni","country":"Comoros","region":"Africa"},
+    {"name":"Algiers","country":"Algeria","region":"Africa"},
+    {"name":"Oran","country":"Algeria","region":"Africa"},
+    {"name":"Constantine","country":"Algeria","region":"Africa"},
+    {"name":"Annaba","country":"Algeria","region":"Africa"},
+    {"name":"Tunis","country":"Tunisia","region":"Africa"},
+    {"name":"Sousse","country":"Tunisia","region":"Africa"},
+    {"name":"Hammamet","country":"Tunisia","region":"Africa"},
+    {"name":"Djerba","country":"Tunisia","region":"Africa"},
+    {"name":"Tripoli","country":"Libya","region":"Africa"},
+    {"name":"Benghazi","country":"Libya","region":"Africa"},
+    {"name":"Misrata","country":"Libya","region":"Africa"},
+    {"name":"Khartoum","country":"Sudan","region":"Africa"},
+    {"name":"Omdurman","country":"Sudan","region":"Africa"},
+    {"name":"Port Sudan","country":"Sudan","region":"Africa"},
+    {"name":"Asmara","country":"Eritrea","region":"Africa"},
+    {"name":"Massawa","country":"Eritrea","region":"Africa"},
+    {"name":"Keren","country":"Eritrea","region":"Africa"},
+    {"name":"N'Djamena","country":"Chad","region":"Africa"},
+    {"name":"Moundou","country":"Chad","region":"Africa"},
+    {"name":"Sarh","country":"Chad","region":"Africa"},
+    {"name":"Bangui","country":"Central African Republic","region":"Africa"},
+    {"name":"Bimbo","country":"Central African Republic","region":"Africa"},
+    {"name":"Berberati","country":"Central African Republic","region":"Africa"},
+    {"name":"Brazzaville","country":"Republic of Congo","region":"Africa"},
+    {"name":"Pointe-Noire","country":"Republic of Congo","region":"Africa"},
+    {"name":"Dolisie","country":"Republic of Congo","region":"Africa"},
+    {"name":"Kinshasa","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Lubumbashi","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Mbuji-Mayi","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Bukavu","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Goma","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Kisangani","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Matadi","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Kananga","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Mbandaka","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Butembo","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Beni","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Uvira","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Kalemie","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Kindu","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Isiro","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Bunia","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Lisala","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Gemena","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Boende","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Basankusu","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Bondo","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Aketi","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Bafwasende","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Watsa","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Niangara","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Dungu","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Faradje","country":"Democratic Republic of Congo","region":"Africa"},
+    {"name":"Ab","country":"Democratic Republic of Congo","region":"Africa"},
 
-    # OCEANIA
+    # OCEANIA (100+ cities)
     {"name":"Sydney","country":"Australia","region":"Oceania"},
     {"name":"Melbourne","country":"Australia","region":"Oceania"},
     {"name":"Brisbane","country":"Australia","region":"Oceania"},
@@ -2123,6 +2517,7 @@ WORLD_CITIES = [
     {"name":"Yaren","country":"Nauru","region":"Oceania"},
     {"name":"South Tarawa","country":"Kiribati","region":"Oceania"},
 ]
+
 REGIONS = set(["Europe", "North America", "Asia", "Oceania", "Middle East", "South America", "Africa"])
 
 @app.route('/')
@@ -2131,16 +2526,14 @@ def home():
         "name": "City Explorer API",
         "version": "2.0.0",
         "status": "operational",
-        "mode": "full-text-no-truncation",
+        "mode": "minimal-preview-mode",
+        "description": "/api/cities returns minimal data (name, 1 image, short description, coordinates, region). Full details on demand.",
         "endpoints": {
             "health": "/api/health",
-            "cities": "/api/cities",
-            "city_details": "/api/cities/<city_name>",
+            "cities": "/api/cities (minimal preview only)",
+            "city_details": "/api/cities/<city_name> (full details)",
             "search": "/api/search",
-            "regions": "/api/regions",
-            "stats": "/api/stats",
-            "cache": "/api/cache",
-            "reload": "/api/reload"
+            "stats": "/api/stats"
         }
     })
 
@@ -2154,21 +2547,18 @@ def health():
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
-        "mode": "full-text",
+        "mode": "minimal-preview",
         "city_loading": loader_status,
         "cache": cache_stats,
         "performance": request_stats,
-        "provider_stats": provider_stats,
-        "text_handling": {
-            "max_text_length": "unlimited",
-            "truncation": "disabled",
-            "summary_truncation": "disabled",
-            "section_truncation": "disabled"
-        }
+        "provider_stats": provider_stats
     })
 
 @app.route('/api/cities')
 def get_cities():
+    """
+    ENDPOINT 1: Returns ONLY name, 1 image, and small description for each city
+    """
     page = request.args.get('page', 1, type=int)
     limit = request.args.get('limit', 30, type=int)
     region = request.args.get('region', type=str)
@@ -2177,134 +2567,61 @@ def get_cities():
     page = max(1, page)
     limit = min(max(1, limit), 100)
     
-    total_cities_in_dataset = len(WORLD_CITIES)
+    # Filter cities
+    filtered_cities = WORLD_CITIES
+    if region:
+        filtered_cities = [c for c in filtered_cities if c.get('region') == region]
+    if country:
+        filtered_cities = [c for c in filtered_cities if c.get('country') == country]
     
-    if city_loader.loading_status['total'] == 0:
-        try:
-            REGIONS.clear()
-            for city in WORLD_CITIES:
-                if 'region' in city:
-                    REGIONS.add(city['region'])
-            
-            city_loader.initialize_with_world_cities(WORLD_CITIES)
-            logger.info(f"📊 City loader initialized with {len(WORLD_CITIES)} cities")
-        except Exception as e:
-            logger.error(f"❌ Failed to initialize city loader: {e}")
-    
+    total_cities = len(filtered_cities)
     start_idx = (page - 1) * limit
-    end_idx = min(start_idx + limit, total_cities_in_dataset)
-    
-    cities_to_load = []
-    for i in range(start_idx, min(end_idx, start_idx + 20)):
-        if i < len(WORLD_CITIES):
-            city_info = WORLD_CITIES[i]
-            city_name = city_info['name']
-            
-            if city_name not in city_loader.loaded_cities:
-                cities_to_load.append(city_info)
-    
-    if cities_to_load:
-        logger.info(f"🔄 Loading {len(cities_to_load)} cities for page {page}")
-        
-        for city_info in cities_to_load[:10]:
-            try:
-                city_preview = data_provider.get_city_preview_enhanced(
-                    city_info['name'],
-                    city_info.get('country'),
-                    city_info.get('region')
-                )
-                
-                city_loader.loaded_cities[city_info['name']] = city_preview
-                city_loader.loading_status['loaded'] += 1
-                
-                if city_preview.get('image') and city_preview['image'].get('url'):
-                    if 'placeholder.com' not in city_preview['image']['url']:
-                        city_loader.loading_status['with_images'] += 1
-                
-                if city_preview.get('coordinates'):
-                    city_loader.loading_status['with_coordinates'] += 1
-                    
-                logger.debug(f"✅ Loaded: {city_info['name']}")
-                
-                time.sleep(0.5)
-                
-            except Exception as e:
-                logger.warning(f"Failed to load {city_info['name']}: {e}")
-                city_loader.loading_status['failed'] += 1
+    end_idx = min(start_idx + limit, total_cities)
     
     cities_list = []
     
-    if region or country:
-        for i in range(start_idx, end_idx):
-            if i < len(WORLD_CITIES):
-                city_info = WORLD_CITIES[i]
-                
-                if region and city_info.get('region') != region:
-                    continue
-                if country and city_info.get('country') != country:
-                    continue
-                
-                city_name = city_info['name']
-                if city_name in city_loader.loaded_cities:
-                    cities_list.append(city_loader.loaded_cities[city_name])
-                else:
-                    cities_list.append({
-                        "id": city_name.lower().replace(' ', '-').replace(',', ''),
-                        "name": city_name,
-                        "display_name": city_name,
-                        "summary": f"Loading data for {city_name}...",
-                        "has_details": False,
-                        "image": image_fetcher.generate_fallback_image(city_name),
-                        "images": [],
-                        "landmarks": [],
-                        "coordinates": None,
-                        "static_map": "https://via.placeholder.com/400x250.png?text=Loading+Map",
-                        "tagline": f"Discover {city_name}",
-                        "tagline_source": "loading",
-                        "last_updated": time.time(),
-                        "country": city_info.get('country'),
-                        "region": city_info.get('region'),
-                        "metadata": {
-                            "image_quality": "loading",
-                            "coordinate_accuracy": "loading",
-                            "data_completeness": 10
-                        }
-                    })
-    else:
-        for i in range(start_idx, end_idx):
-            if i < len(WORLD_CITIES):
-                city_info = WORLD_CITIES[i]
-                city_name = city_info['name']
-                
-                if city_name in city_loader.loaded_cities:
-                    cities_list.append(city_loader.loaded_cities[city_name])
-                else:
-                    cities_list.append({
-                        "id": city_name.lower().replace(' ', '-').replace(',', ''),
-                        "name": city_name,
-                        "display_name": city_name,
-                        "summary": f"Loading detailed information for {city_name}...",
-                        "has_details": False,
-                        "image": image_fetcher.generate_fallback_image(city_name),
-                        "images": [],
-                        "landmarks": [],
-                        "coordinates": None,
-                        "static_map": "https://via.placeholder.com/400x250.png?text=Loading+Map",
-                        "tagline": f"Explore {city_name}",
-                        "tagline_source": "loading",
-                        "last_updated": time.time(),
-                        "country": city_info.get('country'),
-                        "region": city_info.get('region'),
-                        "metadata": {
-                            "image_quality": "loading",
-                            "coordinate_accuracy": "loading",
-                            "data_completeness": 10
-                        }
-                    })
-    
-    total_pages = max(1, (total_cities_in_dataset + limit - 1) // limit)
-    
-    city_loader.loading_status['total'] = total_cities_in_dataset
+    for i in range(start_idx, end_idx):
+        city_info = filtered_cities[i]
+        city_name = city_info['name']
+        
+        # Get the existing minimal preview
+        try:
+            city_preview = data_provider.get_city_preview_minimal(
+                city_info['name'],
+                city_info.get('country'),
+                city_info.get('region')
+            )
+            
+            cities_list.append({
+                "id": city_preview["id"],
+                "name": city_preview["name"],
+                "display_name": city_preview["display_name"],
+                "country": city_preview["country"],
+                "region": city_preview["region"],
+                "image": city_preview["image"], 
+                "coordinates": city_preview["coordinates"],
+                "summary": city_preview["summary"],
+                "has_details": True 
+            })
+            
+        except Exception as e:
+            logger.warning(f"Failed to load {city_name}: {e}")
+            cities_list.append({
+                "id": city_name.lower().replace(' ', '-'),
+                "name": city_name,
+                "display_name": city_name,
+                "country": city_info.get('country'),
+                "region": city_info.get('region'),
+                "image": {
+                    "url": f"https://via.placeholder.com/400x300.png?text={quote_plus(city_name)}",
+                    "title": city_name,
+                    "description": f"Image of {city_name}",
+                    "source": "placeholder"
+                },
+                "coordinates": None,
+                "summary": f"{city_name}, {city_info.get('country', 'a city')}",
+                "has_details": False
+            })
     
     return jsonify({
         "success": True,
@@ -2312,20 +2629,105 @@ def get_cities():
         "pagination": {
             "page": page,
             "limit": limit,
-            "total": total_cities_in_dataset,
-            "pages": total_pages,
-            "next_page": page + 1 if page < total_pages else None,
+            "total": total_cities,
+            "pages": max(1, (total_cities + limit - 1) // limit),
+            "next_page": page + 1 if end_idx < total_cities else None,
             "prev_page": page - 1 if page > 1 else None
-        },
-        "loading": {
-            "complete": False,
-            "loaded": city_loader.loading_status['loaded'],
-            "total": total_cities_in_dataset,
-            "progress": f"{(city_loader.loading_status['loaded'] / max(total_cities_in_dataset, 1) * 100):.1f}%",
-            "message": f"{city_loader.loading_status['loaded']} cities fully loaded. Others will load when accessed."
-        },
-        "text_mode": "full-content-no-truncation"
+        }
     })
+
+@app.route('/api/cities/<path:city_name>')
+def get_city(city_name):
+    """
+    ENDPOINT 2: Returns ALL images and REAL landmarks
+    """
+    city_name = unquote(city_name)
+    
+    # Find city
+    city_info = None
+    for city in WORLD_CITIES:
+        if city['name'].lower() == city_name.lower():
+            city_info = city
+            break
+    
+    if not city_info:
+        return jsonify({"success": False, "error": "City not found"}), 404
+    
+    try:
+        # Get ALL images
+        all_images = image_fetcher.get_images_for_city(
+            city_info['name'],
+            city_info.get('name'),  # Use city name as page title
+            limit=config.MAX_IMAGES_PER_REQUEST
+        )
+        
+        # Get Wikipedia data for landmarks
+        wiki_data, wiki_title = data_provider.get_wikipedia_data_enhanced(
+            city_info['name'],
+            city_info.get('country')
+        )
+        
+        # Extract REAL landmarks from Wikipedia sections
+        landmarks = []
+        if wiki_data and wiki_data.get('sections'):
+            for section in wiki_data.get('sections', []):
+                section_title = section.get('title', '').lower()
+                section_content = section.get('content', '').lower()
+                
+                # Look for actual landmarks in content
+                if any(keyword in section_title for keyword in ['landmarks', 'attractions', 'architecture', 'monuments', 'tourist']):
+                    # This section is about landmarks - extract specific ones
+                    lines = section_content.split('.')
+                    for line in lines:
+                        line = line.strip()
+                        if len(line) > 20 and any(word in line for word in [' is ', ' was ', ' built ', ' constructed ', ' located ', ' famous ', ' known ']):
+                            # Likely a landmark description
+                            landmarks.append(line[:100] + '...')
+        
+        # If no landmarks found in sections, use some from the summary
+        if not landmarks and wiki_data and wiki_data.get('summary'):
+            summary = wiki_data.get('summary', '')
+            # Look for famous things mentioned
+            sentences = summary.split('.')
+            for sentence in sentences[:5]:
+                sentence = sentence.strip()
+                if len(sentence) > 30 and any(word in sentence.lower() for word in ['famous', 'known', 'notable', 'major', 'popular']):
+                    landmarks.append(sentence[:150] + '...')
+        
+        # Get coordinates
+        coords_result = data_provider.get_coordinates_enhanced(
+            city_info['name'],
+            city_info.get('country'),
+            city_info.get('region')
+        )
+        
+        coordinates = None
+        if coords_result:
+            lat, lon, _ = coords_result
+            coordinates = {"lat": lat, "lon": lon}
+        
+        return jsonify({
+            "success": True,
+            "data": {
+                "id": city_info['name'].lower().replace(' ', '-'),
+                "name": city_info['name'],
+                "country": city_info.get('country'),
+                "region": city_info.get('region'),
+                "all_images": all_images,
+                "image_count": len(all_images),
+                "landmarks": landmarks[:10],
+                "wiki_summary": wiki_data.get('summary', '') if wiki_data else "",
+                "wiki_url": wiki_data.get('fullurl', '') if wiki_data else "",
+                "coordinates": coordinates
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Failed to get city {city_name}: {e}")
+        return jsonify({
+            "success": False,
+            "error": "Failed to fetch city details"
+        }), 500
 
 @app.route('/api/search')
 def search_cities():
@@ -2340,6 +2742,10 @@ def search_cities():
     limit = request.args.get('limit', 20, type=int)
     limit = min(max(1, limit), 50)
     
+    # Load WORLD_CITIES if not loaded
+    if not WORLD_CITIES:
+        load_world_cities()
+    
     results = []
     
     for city in WORLD_CITIES:
@@ -2350,12 +2756,35 @@ def search_cities():
                 results.append(city_loader.loaded_cities[city_name])
             else:
                 try:
-                    city_data = data_provider.get_city_preview_enhanced(
+                    # Load minimal preview for search results
+                    city_data = data_provider.get_city_preview_minimal(
                         city['name'],
                         city.get('country'),
                         city.get('region')
                     )
-                    results.append(city_data)
+                    
+                    # Ensure minimal structure
+                    minimal_data = {
+                        "id": city_data["id"],
+                        "name": city_data["name"],
+                        "display_name": city_data["display_name"],
+                        "summary": city_data["summary"],
+                        "has_details": False,
+                        "image": city_data["image"],
+                        "images": [],  # EMPTY
+                        "coordinates": city_data["coordinates"],
+                        "static_map": city_data["static_map"],
+                        "tagline": city_data["tagline"],
+                        "last_updated": city_data["last_updated"],
+                        "country": city_data["country"],
+                        "region": city_data["region"],
+                        "landmarks": [],  # EMPTY
+                        "metadata": {
+                            "data_type": "minimal_preview"
+                        }
+                    }
+                    
+                    results.append(minimal_data)
                 except Exception:
                     pass
             
@@ -2366,79 +2795,9 @@ def search_cities():
         "success": True,
         "query": query,
         "count": len(results),
-        "data": results
+        "data": results,
+        "data_type": "minimal_preview"
     })
-
-@app.route('/api/regions')
-def get_regions():
-    regions = list(REGIONS)
-    regions.sort()
-    
-    region_stats = {}
-    for city in WORLD_CITIES:
-        region = city.get('region')
-        if region:
-            region_stats[region] = region_stats.get(region, 0) + 1
-    
-    return jsonify({
-        "success": True,
-        "count": len(regions),
-        "data": regions,
-        "stats": region_stats
-    })
-
-@app.route('/api/cities/<path:city_name>')
-def get_city(city_name):
-    city_name = unquote(city_name)
-    
-    city_info = None
-    for city in WORLD_CITIES:
-        if city['name'].lower() == city_name.lower():
-            city_info = city
-            break
-    
-    if not city_info:
-        return jsonify({
-            "success": False,
-            "error": "City not found"
-        }), 404
-    
-    try:
-        details = data_provider.get_city_details_enhanced(
-            city_info['name'],
-            city_info.get('country'),
-            city_info.get('region')
-        )
-        
-        logger.info(f"✅ Delivering FULL TEXT data for {city_name}: {len(details.get('detailed_summary', ''))} chars in summary")
-        
-        return jsonify({
-            "success": True,
-            "data": details,
-            "text_info": {
-                "summary_length": len(details.get('summary', '')),
-                "detailed_summary_length": len(details.get('detailed_summary', '')),
-                "sections_count": len(details.get('sections', [])),
-                "total_content_chars": sum(len(s.get('content', '')) for s in details.get('sections', [])) + len(details.get('detailed_summary', '')),
-                "truncation": "disabled"
-            }
-        })
-        
-    except Exception as e:
-        logger.error(f"Failed to get details for {city_name}: {e}")
-        
-        preview = city_loader.get_city(city_info['name'])
-        if preview:
-            return jsonify({
-                "success": True,
-                "data": preview,
-                "warning": "Full details unavailable, showing preview only"
-            })
-        
-        return jsonify({
-            "success": False,
-            "error": "Failed to fetch city details"
-        }), 500
 
 @app.route('/api/stats')
 def get_stats():
@@ -2447,95 +2806,17 @@ def get_stats():
     provider_stats = data_provider.get_stats()
     request_stats = request_handler.get_performance_stats()
     
-    total_cities = max(loader_status.get('loaded', 1), 1)
-    
     return jsonify({
         "city_statistics": {
-            "total_cities": len(WORLD_CITIES),
-            "loaded_cities": loader_status.get('loaded', 0),
-            "loading_in_progress": city_loader.is_loading,
-            "cities_with_images": loader_status.get('with_images', 0),
-            "image_success_rate": f"{loader_status.get('with_images', 0) / total_cities:.1%}",
-            "cities_with_coordinates": loader_status.get('with_coordinates', 0),
-            "coordinate_success_rate": f"{loader_status.get('with_coordinates', 0) / total_cities:.1%}"
+            "total_cities": len(WORLD_CITIES) if WORLD_CITIES else 0,
+            "previews_loaded": loader_status.get('previews_loaded', 0),
+            "details_loaded": loader_status.get('details_loaded', 0),
         },
         "cache_statistics": cache_stats,
         "provider_statistics": provider_stats,
         "performance": request_stats,
-        "text_settings": {
-            "max_text_length": "unlimited",
-            "summary_truncation": "disabled",
-            "section_truncation": "disabled",
-            "detailed_summary_truncation": "disabled"
-        }
+        "mode": "minimal_preview_for_listings"
     })
-
-@app.route('/api/reload')
-def reload_city():
-    city_name = request.args.get('city', '').strip()
-    
-    if not city_name:
-        return jsonify({
-            "success": False,
-            "error": "City name is required"
-        }), 400
-    
-    city_info = None
-    for city in WORLD_CITIES:
-        if city['name'].lower() == city_name.lower():
-            city_info = city
-            break
-    
-    if not city_info:
-        return jsonify({
-            "success": False,
-            "error": "City not found"
-        }), 404
-    
-    try:
-        # Clear cache for this city
-        cache_keys = [
-            f"preview:{city_name}",
-            f"details:{city_name}",
-            f"coords:{city_name}:{city_info.get('country')}",
-            f"wiki:{city_name}:{city_info.get('country')}",
-            f"tagline:{city_name}:{city_info.get('country')}"
-        ]
-        
-        for key in cache_keys:
-            try:
-                if hasattr(cache, 'delete'):
-                    cache.delete(key)
-                elif hasattr(cache, 'set'):
-                    cache.set(key, None, expire=0)
-            except Exception:
-                pass
-        
-        details = data_provider.get_city_details_enhanced(
-            city_info['name'],
-            city_info.get('country'),
-            city_info.get('region')
-        )
-        
-        if hasattr(city_loader, 'loaded_cities') and city_name in city_loader.loaded_cities:
-            city_loader.loaded_cities[city_name] = data_provider.get_city_preview_enhanced(
-                city_info['name'],
-                city_info.get('country'),
-                city_info.get('region')
-            )
-        
-        return jsonify({
-            "success": True,
-            "message": f"City {city_name} reloaded successfully",
-            "data": details
-        })
-        
-    except Exception as e:
-        logger.error(f"Failed to reload city {city_name}: {e}")
-        return jsonify({
-            "success": False,
-            "error": f"Failed to reload city: {str(e)}"
-        }), 500
 
 @app.errorhandler(404)
 def not_found(error):
@@ -2552,13 +2833,43 @@ def internal_error(error):
         "error": "Internal server error"
     }), 500
 
+def load_world_cities():
+    """Load world cities from JSON file or environment variable"""
+    global WORLD_CITIES
+    
+    try:
+        # Try to load from JSON file
+        cities_file = os.getenv("CITIES_JSON_FILE", "/tmp/cities.json")
+        if os.path.exists(cities_file):
+            with open(cities_file, 'r') as f:
+                WORLD_CITIES = json.load(f)
+                logger.info(f"✅ Loaded {len(WORLD_CITIES)} cities from {cities_file}")
+                return
+        
+        # Try to load from environment variable
+        cities_json = os.getenv("WORLD_CITIES_JSON")
+        if cities_json:
+            WORLD_CITIES = json.loads(cities_json)
+            logger.info(f"✅ Loaded {len(WORLD_CITIES)} cities from environment")
+            return
+        
+        # Fallback to empty list
+        WORLD_CITIES = []
+        logger.warning("⚠️ No city data found. Please provide cities data.")
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to load world cities: {e}")
+        WORLD_CITIES = []
+
 if __name__ == '__main__':
-    logger.info("🚀 Starting City Explorer API in FULL TEXT MODE")
+    logger.info("🚀 Starting City Explorer API with MINIMAL PREVIEW MODE")
+    
+    load_world_cities()
     
     if WORLD_CITIES and len(WORLD_CITIES) > 0:
         logger.info(f"📊 Total cities: {len(WORLD_CITIES)}")
     else:
-        logger.error("❌ WORLD_CITIES is empty! Add your 1500+ cities data")
+        logger.error("❌ WORLD_CITIES is empty! Please provide city data")
     
     port = int(os.environ.get('PORT', 5000))
     
@@ -2569,22 +2880,11 @@ if __name__ == '__main__':
         threaded=True
     )
 else:
-    logger.info("🔧 Running in VERCEL serverless mode with FULL TEXT")
+    logger.info("🔧 Running in serverless mode with MINIMAL PREVIEW")
+    
+    load_world_cities()
     
     if WORLD_CITIES and len(WORLD_CITIES) > 0:
         logger.info(f"📊 Found {len(WORLD_CITIES)} cities")
-        
-        try:
-            REGIONS.clear()
-            for city in WORLD_CITIES:
-                if 'region' in city:
-                    REGIONS.add(city['region'])
-            
-            city_loader.initialize_with_world_cities(WORLD_CITIES)
-            logger.info(f"✅ City loader initialized with {len(WORLD_CITIES)} cities")
-            logger.info("⚠️ Note: Cities will load on-demand when requested")
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to initialize city data: {e}")
     else:
-        logger.error("❌ WORLD_CITIES is empty in Vercel environment")
+        logger.error("❌ No city data available")
