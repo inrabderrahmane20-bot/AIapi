@@ -5,264 +5,462 @@ import time
 import logging
 import hashlib
 from typing import List, Dict, Optional, Tuple, Any
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from collections import defaultdict
 from urllib.parse import quote_plus, unquote
 import requests
+import wikipediaapi
+import diskcache
+from geopy.geocoders import Nominatim
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dataclasses import dataclass, field
+import redis
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # ==================== SIMPLIFIED CONFIGURATION ====================
 @dataclass
 class Config:
+    # Cache settings - longer TTL for better performance
+    CACHE_TTL: int = int(os.getenv("CACHE_TTL", "86400"))  # 24 hours
+    CACHE_TTL_IMAGES: int = int(os.getenv("CACHE_TTL_IMAGES", "172800"))  # 48 hours
+    CACHE_TTL_PREVIEW: int = int(os.getenv("CACHE_TTL_PREVIEW", "86400"))  # 24 hours
+    
+    # Performance settings
+    MAX_WORKERS: int = int(os.getenv("MAX_WORKERS", "5"))
+    REQUEST_TIMEOUT: int = int(os.getenv("REQUEST_TIMEOUT", "10"))
+    WIKIPEDIA_TIMEOUT: int = int(os.getenv("WIKIPEDIA_TIMEOUT", "15"))
+    GEOLOCATOR_TIMEOUT: int = int(os.getenv("GEOLOCATOR_TIMEOUT", "5"))
+    
+    # App settings
     FLASK_DEBUG: bool = os.getenv("FLASK_DEBUG", "false").lower() == "true"
     FLASK_PORT: int = int(os.getenv("PORT", os.getenv("FLASK_PORT", "5000")))
     
-    # CACHE SETTINGS
-    CACHE_TTL_PREVIEW: int = int(os.getenv("CACHE_TTL_PREVIEW", "604800"))  # 7 days
+    # Cache directories
+    CACHE_DIR: str = os.getenv("CACHE_DIR", "/tmp/city_explorer_cache")
+    IMAGE_CACHE_DIR: str = os.getenv("IMAGE_CACHE_DIR", "/tmp/image_cache")
     
-    # PERFORMANCE SETTINGS
-    MAX_PARALLEL_REQUESTS: int = int(os.getenv("MAX_PARALLEL_REQUESTS", "3"))
-    REQUEST_TIMEOUT: int = int(os.getenv("REQUEST_TIMEOUT", "5"))
+    # Image settings
+    MAX_IMAGES_PER_REQUEST: int = 8
+    MAX_IMAGES_PREVIEW: int = 1
+    MIN_IMAGE_WIDTH: int = 400
+    MIN_IMAGE_HEIGHT: int = 300
     
-    # IMAGE SETTINGS - USE PLACEHOLDERS FOR SPEED
-    USE_PLACEHOLDER_IMAGES: bool = os.getenv("USE_PLACEHOLDER_IMAGES", "true").lower() == "true"
-    PLACEHOLDER_WIDTH: int = 400
-    PLACEHOLDER_HEIGHT: int = 300
-    
-    # DATA SETTINGS
-    ENABLE_EXTERNAL_API_FALLBACK: bool = os.getenv("ENABLE_EXTERNAL_API_FALLBACK", "false").lower() == "true"
-    MAX_CITIES_PER_REQUEST: int = int(os.getenv("MAX_CITIES_PER_REQUEST", "100"))
+    # Feature flags
+    ENABLE_FALLBACK_IMAGES: bool = True
+    ENABLE_COORDINATE_FALLBACK: bool = True
     
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
 config = Config()
 
-# ==================== SIMPLIFIED LOGGING ====================
+# ==================== LOGGING ====================
 logging.basicConfig(level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO))
 logger = logging.getLogger("CityExplorer")
 
-# ==================== SIMPLE CACHE ====================
-class SimpleCache:
+# ==================== ENHANCED CACHING SYSTEM ====================
+class EnhancedCache:
     def __init__(self):
-        self.cache = {}
+        self.memory_cache = {}
+        self.disk_cache = None
+        
+        try:
+            os.makedirs(config.CACHE_DIR, exist_ok=True)
+            os.makedirs(config.IMAGE_CACHE_DIR, exist_ok=True)
+            self.disk_cache = diskcache.Cache(config.CACHE_DIR)
+            logger.info(f"✅ Disk cache initialized at: {config.CACHE_DIR}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to initialize disk cache: {e}")
+            self.disk_cache = diskcache.Cache()
+        
+        # Try Redis if available
+        self.redis_client = None
+        if os.getenv("REDIS_URL"):
+            try:
+                self.redis_client = redis.from_url(os.getenv("REDIS_URL"))
+                self.redis_client.ping()
+                logger.info("✅ Redis cache connected")
+            except Exception as e:
+                logger.warning(f"⚠️ Redis cache unavailable: {e}")
     
     def get(self, key: str, default=None):
-        if key in self.cache:
-            item = self.cache[key]
-            if time.time() - item.get('timestamp', 0) < config.CACHE_TTL_PREVIEW:
+        # Check memory cache first (fastest)
+        if key in self.memory_cache:
+            item = self.memory_cache.get(key)
+            if item and time.time() - item.get('timestamp', 0) < config.CACHE_TTL:
                 return item.get('value')
+        
+        # Check Redis if available
+        if self.redis_client:
+            try:
+                cached = self.redis_client.get(f"city:{key}")
+                if cached:
+                    data = json.loads(cached)
+                    # Also store in memory cache for faster access
+                    self.memory_cache[key] = {
+                        'value': data,
+                        'timestamp': time.time()
+                    }
+                    return data
+            except Exception:
+                pass
+        
+        # Check disk cache
+        if self.disk_cache:
+            try:
+                cached = self.disk_cache.get(key)
+                if cached and time.time() - cached.get('timestamp', 0) < config.CACHE_TTL:
+                    # Store in memory cache for faster access
+                    self.memory_cache[key] = cached
+                    return cached.get('value')
+            except Exception:
+                pass
+        
         return default
     
-    def set(self, key: str, value: Any):
-        self.cache[key] = {
+    def set(self, key: str, value: Any, ttl: int = None):
+        cache_item = {
             'value': value,
             'timestamp': time.time()
         }
-
-cache = SimpleCache()
-
-# ==================== TEXT PROCESSING ====================
-def clean_text(text: str) -> str:
-    if not text:
-        return ""
-    
-    cleaned = re.sub(r'\[\d+\]', '', text)
-    cleaned = re.sub(r'\{\{.*?\}\}', '', cleaned)
-    cleaned = re.sub(r'<[^>]+>', '', cleaned)
-    cleaned = re.sub(r'\s+', ' ', cleaned)
-    
-    return cleaned.strip()
-
-# ==================== SUPER FAST IMAGE PROVIDER ====================
-class FastImageProvider:
-    """Provides placeholder images INSTANTLY without external API calls"""
-    
-    # Color palettes for different regions
-    REGION_COLORS = {
-        "Europe": ["#3498db", "#2980b9", "#1f618d"],
-        "Asia": ["#e74c3c", "#c0392b", "#a93226"],
-        "Africa": ["#f39c12", "#d68910", "#b9770e"],
-        "North America": ["#2ecc71", "#27ae60", "#229954"],
-        "South America": ["#9b59b6", "#8e44ad", "#7d3c98"],
-        "Middle East": ["#1abc9c", "#17a589", "#148f77"],
-        "Oceania": ["#e67e22", "#d35400", "#ba4a00"]
-    }
-    
-    @staticmethod
-    def get_placeholder_image(city_name: str, region: str = None) -> Dict:
-        """Generate a placeholder image URL instantly"""
-        colors = FastImageProvider.REGION_COLORS.get(region, ["#3498db", "#2980b9", "#1f618d"])
-        bg_color = colors[hash(city_name) % len(colors)]
         
-        # Use a simple placeholder service
-        encoded_city = quote_plus(city_name)
+        # Store in memory cache
+        self.memory_cache[key] = cache_item
         
-        return {
-            'url': f'https://via.placeholder.com/{config.PLACEHOLDER_WIDTH}x{config.PLACEHOLDER_HEIGHT}/{bg_color[1:]}/ffffff?text={encoded_city}',
-            'title': f'{city_name}',
-            'description': f'Image representing {city_name}',
-            'source': 'placeholder',
-            'width': config.PLACEHOLDER_WIDTH,
-            'height': config.PLACEHOLDER_HEIGHT
-        }
+        # Store in Redis if available
+        if self.redis_client:
+            try:
+                ttl_actual = ttl or config.CACHE_TTL
+                self.redis_client.setex(
+                    f"city:{key}",
+                    ttl_actual,
+                    json.dumps(value, default=str)
+                )
+            except Exception:
+                pass
+        
+        # Store in disk cache
+        if self.disk_cache:
+            try:
+                self.disk_cache.set(key, cache_item, expire=ttl or config.CACHE_TTL)
+            except Exception:
+                pass
+
+cache = EnhancedCache()
+
+# ==================== REQUEST HANDLER ====================
+class RequestHandler:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (compatible; CityExplorer/2.0; +https://traveltto.com)',
+            'Accept': 'application/json',
+            'Accept-Language': 'en-US,en;q=0.9'
+        })
     
-    @staticmethod
-    def get_city_image(city_name: str, country: str = None, region: str = None) -> Dict:
-        """Get ONE image for city - uses placeholder for SPEED"""
-        cache_key = f"image:{city_name}:{country}"
+    @retry(
+        stop=stop_after_attempt(2),
+        wait=wait_exponential(multiplier=1, min=2, max=5)
+    )
+    def get_json(self, url: str, params: dict = None) -> Any:
+        try:
+            response = self.session.get(
+                url,
+                params=params,
+                timeout=config.REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            logger.debug(f"Request failed for {url}: {e}")
+            return None
+    
+    def get_json_cached(self, url: str, params: dict = None, cache_key: str = None) -> Any:
+        if not cache_key:
+            cache_key = hashlib.md5(
+                f"{url}{json.dumps(params or {}, sort_keys=True)}".encode()
+            ).hexdigest()
+        
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+        
+        data = self.get_json(url, params)
+        if data:
+            cache.set(cache_key, data, config.CACHE_TTL)
+        
+        return data
+
+request_handler = RequestHandler()
+
+# ==================== IMAGE FETCHER (KEEPING YOUR LOGIC) ====================
+class IntelligentImageFetcher:
+    def __init__(self):
+        self.wikimedia_api = "https://commons.wikimedia.org/w/api.php"
+        self.wikipedia_api = "https://en.wikipedia.org/w/api.php"
+    
+    def get_one_representative_image(self, city_name: str, page_title: str = None) -> Optional[Dict]:
+        """Get ONLY ONE representative image for city preview"""
+        cache_key = f"one_image:{city_name}:{page_title}"
         
         cached = cache.get(cache_key)
         if cached:
             return cached
         
-        if config.USE_PLACEHOLDER_IMAGES:
-            image = FastImageProvider.get_placeholder_image(city_name, region)
-            cache.set(cache_key, image)
-            return image
-        
-        # Fallback to external API (disabled by default for speed)
-        if config.ENABLE_EXTERNAL_API_FALLBACK:
-            try:
-                # Simple Wikipedia image fetch with timeout
-                api_url = "https://en.wikipedia.org/w/api.php"
+        try:
+            # Try to get Wikipedia page image first
+            if page_title:
                 params = {
                     'action': 'query',
-                    'titles': city_name,
+                    'titles': page_title,
                     'prop': 'pageimages',
-                    'pithumbsize': 400,
+                    'pithumbsize': 800,
                     'format': 'json'
                 }
                 
-                response = requests.get(api_url, params=params, timeout=config.REQUEST_TIMEOUT)
-                data = response.json()
+                data = request_handler.get_json_cached(
+                    self.wikipedia_api,
+                    params=params,
+                    cache_key=f"wiki_page_image:{page_title}"
+                )
                 
+                if data:
+                    pages = data.get('query', {}).get('pages', {})
+                    for page in pages.values():
+                        if 'thumbnail' in page:
+                            thumb = page['thumbnail']
+                            image = {
+                                'url': thumb['source'],
+                                'title': f'Image of {city_name}',
+                                'description': f'Featured image from Wikipedia',
+                                'source': 'wikipedia',
+                                'width': thumb.get('width'),
+                                'height': thumb.get('height')
+                            }
+                            cache.set(cache_key, image, config.CACHE_TTL_IMAGES)
+                            return image
+        except Exception as e:
+            logger.debug(f"Wikipedia image fetch failed: {e}")
+        
+        # Fallback image
+        encoded_city = quote_plus(city_name)
+        fallback_image = {
+            'url': f'https://images.unsplash.com/photo-1519681393784-d120267933ba?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80&txt={encoded_city}&txt-size=40&txt-color=white&txt-align=middle,center',
+            'title': f'{city_name}',
+            'description': f'Representation of {city_name}',
+            'source': 'placeholder',
+            'width': 800,
+            'height': 600
+        }
+        
+        cache.set(cache_key, fallback_image, config.CACHE_TTL_IMAGES)
+        return fallback_image
+    
+    def get_images_for_city(self, city_name: str, page_title: str = None, limit: int = None) -> List[Dict]:
+        """Get multiple images for detailed view"""
+        limit = limit or config.MAX_IMAGES_PER_REQUEST
+        cache_key = f"all_images:{city_name}:{page_title}:{limit}"
+        
+        cached = cache.get(cache_key)
+        if cached:
+            return cached
+        
+        images = []
+        
+        try:
+            # Try Wikipedia images
+            params = {
+                'action': 'query',
+                'titles': page_title or city_name,
+                'prop': 'images|pageimages',
+                'pithumbsize': 800,
+                'imlimit': limit,
+                'format': 'json'
+            }
+            
+            data = request_handler.get_json_cached(
+                self.wikipedia_api,
+                params=params,
+                cache_key=f"wikipedia_images:{page_title or city_name}"
+            )
+            
+            if data:
                 pages = data.get('query', {}).get('pages', {})
                 for page in pages.values():
                     if 'thumbnail' in page:
                         thumb = page['thumbnail']
-                        image = {
+                        images.append({
                             'url': thumb['source'],
-                            'title': f'{city_name}',
-                            'description': f'Image from Wikipedia',
+                            'title': f'Main image of {city_name}',
+                            'description': 'Featured image from Wikipedia',
                             'source': 'wikipedia',
                             'width': thumb.get('width'),
                             'height': thumb.get('height')
-                        }
-                        cache.set(cache_key, image)
-                        return image
-            except Exception as e:
-                logger.debug(f"Image fetch failed for {city_name}: {e}")
+                        })
+        except Exception as e:
+            logger.debug(f"Wikipedia images failed: {e}")
         
-        # Default placeholder
-        image = FastImageProvider.get_placeholder_image(city_name, region)
-        cache.set(cache_key, image)
-        return image
+        # If we don't have enough images, add fallbacks
+        while len(images) < min(limit, 3):
+            encoded_city = quote_plus(city_name)
+            images.append({
+                'url': f'https://images.unsplash.com/photo-1519681393784-d120267933ba?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80&txt={encoded_city}&txt-size=40&txt-color=white&txt-align=middle,center',
+                'title': f'{city_name}',
+                'description': f'Representation of {city_name}',
+                'source': 'placeholder',
+                'width': 800,
+                'height': 600
+            })
+        
+        cache.set(cache_key, images, config.CACHE_TTL_IMAGES)
+        return images[:limit]
 
-# ==================== SUPER FAST CITY DATA PROVIDER ====================
-class FastCityDataProvider:
-    """Provides city data INSTANTLY with minimal external API calls"""
+image_fetcher = IntelligentImageFetcher()
+
+# ==================== CITY DATA PROVIDER (OPTIMIZED) ====================
+class CityDataProvider:
+    def __init__(self):
+        self.geolocator = Nominatim(
+            user_agent="CityExplorer/2.0 (https://traveltto.com)",
+            timeout=config.GEOLOCATOR_TIMEOUT
+        )
+        self.wiki = wikipediaapi.Wikipedia(
+            language='en',
+            user_agent='CityExplorer/2.0 (https://traveltto.com)',
+            extract_format=wikipediaapi.ExtractFormat.WIKI
+        )
     
-    # Pre-defined short descriptions for common cities
-    COMMON_CITY_DESCRIPTIONS = {
-        # Europe
-        "Paris": "Paris, France's capital, is a major European city and a global center for art, fashion, gastronomy and culture.",
-        "London": "London, the capital of England and the United Kingdom, is a 21st-century city with history stretching back to Roman times.",
-        "Rome": "Rome, Italy's capital, is a sprawling, cosmopolitan city with nearly 3,000 years of globally influential art, architecture and culture.",
-        "Berlin": "Berlin, Germany's capital, dates to the 13th century. Reminders of the city's turbulent 20th-century history include its Holocaust memorial.",
-        
-        # North America
-        "New York City": "New York City comprises 5 boroughs sitting where the Hudson River meets the Atlantic Ocean. Its iconic sites include skyscrapers such as the Empire State Building.",
-        "Los Angeles": "Los Angeles is a sprawling Southern California city and the center of the nation's film and television industry.",
-        "Toronto": "Toronto, the capital of the province of Ontario, is a major Canadian city along Lake Ontario's northwestern shore.",
-        
-        # Asia
-        "Tokyo": "Tokyo, Japan's bustling capital, mixes the ultramodern and the traditional, from neon-lit skyscrapers to historic temples.",
-        "Beijing": "Beijing, China's massive capital, has history stretching back 3 millennia. Yet it's known as much for modern architecture as its ancient sites.",
-        "Singapore": "Singapore, an island city-state off southern Malaysia, is a global financial center with a tropical climate and multicultural population.",
-        
-        # Middle East
-        "Dubai": "Dubai is a city and emirate in the United Arab Emirates known for luxury shopping, ultramodern architecture and a lively nightlife scene.",
-        "Abu Dhabi": "Abu Dhabi, the capital of the United Arab Emirates, sits off the mainland on an island in the Persian (Arabian) Gulf.",
-        
-        # Africa
-        "Cape Town": "Cape Town is a port city on South Africa's southwest coast, on a peninsula beneath the imposing Table Mountain.",
-        "Marrakech": "Marrakech, a former imperial city in western Morocco, is a major economic center and home to mosques, palaces and gardens.",
-        
-        # South America
-        "Rio de Janeiro": "Rio de Janeiro is a huge seaside city in Brazil, famed for its Copacabana and Ipanema beaches, 38m Christ the Redeemer statue atop Mount Corcovado.",
-        "Buenos Aires": "Buenos Aires is Argentina's big, cosmopolitan capital city. Its center is the Plaza de Mayo, lined with stately 19th-century buildings.",
-        
-        # Oceania
-        "Sydney": "Sydney, capital of New South Wales and one of Australia's largest cities, is best known for its harbourfront Sydney Opera House.",
-        "Auckland": "Auckland, based around 2 large harbours, is a major city in the north of New Zealand's North Island."
-    }
-    
-    @staticmethod
-    def get_city_description(city_name: str, country: str = None) -> str:
-        """Get a short description for a city - uses predefined or generates one"""
-        cache_key = f"desc:{city_name}:{country}"
+    def _get_short_description(self, city_name: str, country: str = None) -> Tuple[Optional[str], Optional[str]]:
+        """Get only 1-2 sentences for preview"""
+        cache_key = f"short_desc:{city_name}:{country}"
         
         cached = cache.get(cache_key)
         if cached:
-            return cached
+            return cached.get('description'), cached.get('title')
         
-        # Check common cities first
-        if city_name in FastCityDataProvider.COMMON_CITY_DESCRIPTIONS:
-            desc = FastCityDataProvider.COMMON_CITY_DESCRIPTIONS[city_name]
-            cache.set(cache_key, desc)
-            return desc
-        
-        # Generate a simple description
+        variations = [city_name]
         if country:
-            desc = f"{city_name} is a city in {country}."
-        else:
-            desc = f"Discover {city_name}, a city with rich culture and history."
+            variations.append(f"{city_name}, {country}")
         
-        cache.set(cache_key, desc)
-        return desc
+        for variation in variations:
+            try:
+                page = self.wiki.page(variation)
+                if page.exists() and page.ns == 0:
+                    summary = page.summary or ""
+                    if summary:
+                        # Get first 2 sentences max
+                        sentences = re.split(r'[.!?]', summary)
+                        short_desc = ""
+                        sentence_count = 0
+                        for sentence in sentences:
+                            if sentence.strip():
+                                short_desc += sentence.strip() + '. '
+                                sentence_count += 1
+                                if sentence_count >= 2:
+                                    break
+                        
+                        short_desc = short_desc.strip()
+                        if short_desc:
+                            cache.set(cache_key, {
+                                'description': short_desc,
+                                'title': page.title
+                            }, config.CACHE_TTL_PREVIEW)
+                            return short_desc, page.title
+            except Exception:
+                continue
+        
+        return None, None
     
-    @staticmethod
-    def get_coordinates(city_name: str, country: str = None, region: str = None) -> Optional[Dict[str, float]]:
-        """Get approximate coordinates - uses regional defaults for SPEED"""
+    def get_coordinates(self, city_name: str, country: str = None) -> Optional[Dict[str, float]]:
+        """Get coordinates with caching"""
         cache_key = f"coords:{city_name}:{country}"
         
         cached = cache.get(cache_key)
         if cached:
             return cached
         
-        # Regional coordinate defaults (approximate centers)
-        REGION_COORDS = {
-            "Europe": {"lat": 48.8566, "lon": 2.3522},  # Paris
-            "Asia": {"lat": 35.6762, "lon": 139.6503},  # Tokyo
-            "Africa": {"lat": -33.9249, "lon": 18.4241},  # Cape Town
-            "North America": {"lat": 40.7128, "lon": -74.0060},  # NYC
-            "South America": {"lat": -23.5505, "lon": -46.6333},  # Sao Paulo
-            "Middle East": {"lat": 25.2048, "lon": 55.2708},  # Dubai
-            "Oceania": {"lat": -33.8688, "lon": 151.2093}  # Sydney
+        try:
+            query = f"{city_name}, {country}" if country else city_name
+            location = self.geolocator.geocode(
+                query,
+                exactly_one=True,
+                timeout=config.GEOLOCATOR_TIMEOUT
+            )
+            
+            if location and hasattr(location, 'latitude'):
+                coords = {"lat": location.latitude, "lon": location.longitude}
+                cache.set(cache_key, coords, config.CACHE_TTL)
+                return coords
+        except Exception as e:
+            logger.debug(f"Coordinates fetch failed for {city_name}: {e}")
+        
+        return None
+    
+    def get_city_preview(self, city_name: str, country: str = None, region: str = None) -> Dict:
+        """Get minimal preview data for city list"""
+        cache_key = f"preview:{city_name}:{country}:{region}"
+        
+        cached = cache.get(cache_key)
+        if cached:
+            return cached
+        
+        # Get short description
+        short_desc, wiki_title = self._get_short_description(city_name, country)
+        
+        # Get one image
+        image = image_fetcher.get_one_representative_image(city_name, wiki_title)
+        
+        # Get coordinates
+        coordinates = self.get_coordinates(city_name, country)
+        
+        # Create preview
+        preview = {
+            "id": city_name.lower().replace(' ', '-'),
+            "name": city_name,
+            "display_name": wiki_title or city_name,
+            "country": country,
+            "region": region,
+            "image": image,
+            "description": short_desc or f"Discover {city_name}, a city in {country or 'the world'}",
+            "coordinates": coordinates,
+            "has_details": True
         }
         
-        # Add some variation based on city name hash
-        city_hash = hash(city_name)
+        cache.set(cache_key, preview, config.CACHE_TTL_PREVIEW)
+        return preview
+    
+    def get_city_details(self, city_name: str, country: str = None, region: str = None) -> Dict:
+        """Get full details for individual city"""
+        cache_key = f"details:{city_name}:{country}:{region}"
         
-        if region in REGION_COORDS:
-            base_coords = REGION_COORDS[region]
-            # Add slight variation (±5 degrees) for different cities
-            lat_variation = (city_hash % 1000) / 1000 * 10 - 5
-            lon_variation = ((city_hash // 1000) % 1000) / 1000 * 10 - 5
-            
-            coords = {
-                "lat": round(base_coords["lat"] + lat_variation, 4),
-                "lon": round(base_coords["lon"] + lon_variation, 4)
-            }
-        else:
-            # Default to Europe coordinates
-            coords = {"lat": 48.8566, "lon": 2.3522}
+        cached = cache.get(cache_key)
+        if cached:
+            return cached
         
-        cache.set(cache_key, coords)
-        return coords
+        # Start with preview
+        preview = self.get_city_preview(city_name, country, region)
+        
+        # Get all images
+        _, wiki_title = self._get_short_description(city_name, country)
+        all_images = image_fetcher.get_images_for_city(city_name, wiki_title)
+        
+        # Build details
+        details = {
+            **preview,
+            "all_images": all_images,
+            "image_count": len(all_images),
+            "landmarks": [],  # Would extract from Wikipedia if needed
+            "wiki_summary": preview.get("description", ""),
+            "detailed_info_available": True
+        }
+        
+        cache.set(cache_key, details, config.CACHE_TTL)
+        return details
 
-# ==================== FLASK APP & ROUTES ====================
+data_provider = CityDataProvider()
+
+# ==================== FLASK APP ====================
 app = Flask(__name__)
 
 CORS(app, 
@@ -1389,11 +1587,7 @@ WORLD_CITIES = [
     {"name":"South Tarawa","country":"Kiribati","region":"Oceania"},
 ]
 
-# Extract unique regions from data
-REGIONS = sorted(list(set(city.get('region') for city in WORLD_CITIES if city.get('region'))))
-
-# Create lookup dictionaries for faster access
-CITY_BY_NAME = {city['name'].lower(): city for city in WORLD_CITIES}
+# Create lookup dictionaries for faster filtering
 CITIES_BY_REGION = {}
 CITIES_BY_COUNTRY = {}
 
@@ -1411,28 +1605,29 @@ for city in WORLD_CITIES:
             CITIES_BY_COUNTRY[country] = []
         CITIES_BY_COUNTRY[country].append(city)
 
+# Get unique regions from data
+REGIONS = sorted(list(set(city.get('region') for city in WORLD_CITIES if city.get('region'))))
+
 @app.route('/')
 def home():
     return jsonify({
         "name": "City Explorer API",
         "version": "3.0.0",
         "status": "operational",
-        "mode": "ultra-fast-minimal-mode",
-        "description": "/api/cities returns ONLY: name, region, description, and ONE placeholder image per city - INSTANTLY",
+        "mode": "optimized-with-caching",
+        "description": "/api/cities returns name, region, description, and ONE image per city with smart caching",
         "features": [
-            "Loads all cities instantly (no external API calls)",
             "Region filtering for faster loading",
-            "Placeholder images (no loading time)",
-            "Local caching",
-            "1000+ cities supported"
+            "Smart caching (memory, Redis, disk)",
+            "Real Wikipedia images and descriptions",
+            "Individual city details on demand"
         ],
         "endpoints": {
             "health": "/api/health",
-            "cities": "/api/cities?region=Europe (returns ALL cities or filtered by region)",
+            "cities": "/api/cities?region=Europe (filter by region/country)",
             "city_details": "/api/cities/<city_name> (full details)",
             "search": "/api/search",
-            "regions": "/api/regions",
-            "stats": "/api/stats"
+            "regions": "/api/regions"
         },
         "total_cities": len(WORLD_CITIES)
     })
@@ -1442,10 +1637,10 @@ def health():
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
-        "mode": "ultra-fast-minimal",
         "world_cities_count": len(WORLD_CITIES),
         "unique_regions": len(REGIONS),
-        "performance_mode": "placeholder_images_only"
+        "cache_enabled": True,
+        "performance_mode": "optimized"
     })
 
 @app.route('/api/regions')
@@ -1460,16 +1655,18 @@ def get_regions():
 @app.route('/api/cities')
 def get_cities():
     """
-    ULTRA-FAST ENDPOINT: Returns ONLY name, region, description, and ONE placeholder image
-    - Loads ALL cities INSTANTLY (no external API calls)
-    - Uses placeholder images for maximum speed
-    - Supports region/country filtering
+    OPTIMIZED ENDPOINT: Returns ONLY name, region, description, and ONE image per city
+    - Supports region/country filtering for faster loading
+    - Uses smart caching for instant responses after first load
+    - Real Wikipedia images and descriptions
     """
     region = request.args.get('region', type=str)
     country = request.args.get('country', type=str)
+    page = request.args.get('page', 1, type=int)
+    limit = request.args.get('limit', 50, type=int)
     
     # Check cache first
-    cache_key = f"cities_list:{region}:{country}"
+    cache_key = f"cities_list:{region}:{country}:{page}:{limit}"
     cached_data = cache.get(cache_key)
     if cached_data:
         logger.info(f"📊 Cache hit for cities (region={region}, country={country})")
@@ -1478,109 +1675,107 @@ def get_cities():
             "data": cached_data,
             "total": len(cached_data),
             "filtered_by": {"region": region, "country": country} if region or country else "all",
-            "cached": True,
-            "performance_mode": "cached"
+            "cached": True
         })
     
-    # Filter cities efficiently
-    if region:
-        filtered_cities = CITIES_BY_REGION.get(region, [])
-    elif country:
-        filtered_cities = CITIES_BY_COUNTRY.get(country, [])
+    # Filter cities efficiently using pre-built dictionaries
+    if region and region in CITIES_BY_REGION:
+        filtered_cities = CITIES_BY_REGION[region]
+    elif country and country in CITIES_BY_COUNTRY:
+        filtered_cities = CITIES_BY_COUNTRY[country]
     else:
         filtered_cities = WORLD_CITIES
     
-    logger.info(f"📊 Processing {len(filtered_cities)} cities (region={region}, country={country})")
+    # Apply pagination
+    total_cities = len(filtered_cities)
+    start_idx = (page - 1) * limit
+    end_idx = min(start_idx + limit, total_cities)
     
-    # Process cities - SUPER FAST, no external API calls
+    logger.info(f"📊 Processing {len(filtered_cities[start_idx:end_idx])} cities (region={region}, country={country})")
+    
+    # Process cities in parallel for faster loading
     cities_list = []
     
-    for city_info in filtered_cities:
-        city_name = city_info['name']
-        country_name = city_info.get('country')
-        region_name = city_info.get('region')
-        
-        # Generate city data INSTANTLY
-        city_data = {
-            "id": city_name.lower().replace(' ', '-'),
-            "name": city_name,
-            "display_name": city_name,
-            "country": country_name,
-            "region": region_name,
-            "image": FastImageProvider.get_city_image(city_name, country_name, region_name),  # INSTANT
-            "description": FastCityDataProvider.get_city_description(city_name, country_name),  # INSTANT
-            "coordinates": FastCityDataProvider.get_coordinates(city_name, country_name, region_name),  # INSTANT
-            "has_details": True
-        }
-        
-        cities_list.append(city_data)
-        
-        # Limit for first load (optional)
-        if len(cities_list) >= config.MAX_CITIES_PER_REQUEST and not region and not country:
-            break
+    def process_city(city_info):
+        try:
+            return data_provider.get_city_preview(
+                city_info['name'],
+                city_info.get('country'),
+                city_info.get('region')
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load {city_info['name']}: {e}")
+            return {
+                "id": city_info['name'].lower().replace(' ', '-'),
+                "name": city_info['name'],
+                "display_name": city_info['name'],
+                "country": city_info.get('country'),
+                "region": city_info.get('region'),
+                "image": {
+                    "url": f"https://via.placeholder.com/400x300.png?text={quote_plus(city_info['name'])}",
+                    "title": city_info['name'],
+                    "description": f"Image of {city_info['name']}",
+                    "source": "placeholder"
+                },
+                "description": f"{city_info['name']}, {city_info.get('country', 'a city')}",
+                "coordinates": None,
+                "has_details": False
+            }
     
-    logger.info(f"✅ Processed {len(cities_list)} cities INSTANTLY")
+    # Use ThreadPoolExecutor for parallel processing
+    with ThreadPoolExecutor(max_workers=min(config.MAX_WORKERS, len(filtered_cities[start_idx:end_idx]))) as executor:
+        cities_list = list(executor.map(process_city, filtered_cities[start_idx:end_idx]))
+    
+    logger.info(f"✅ Processed {len(cities_list)} cities")
     
     # Cache the results
-    cache.set(cache_key, cities_list)
+    cache.set(cache_key, cities_list, config.CACHE_TTL_PREVIEW)
     
     return jsonify({
         "success": True,
         "data": cities_list,
-        "total": len(cities_list),
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total_cities,
+            "pages": max(1, (total_cities + limit - 1) // limit),
+            "next_page": page + 1 if end_idx < total_cities else None,
+            "prev_page": page - 1 if page > 1 else None
+        },
         "filtered_by": {"region": region, "country": country} if region or country else "all",
-        "cached": False,
-        "performance_mode": "instant_placeholders",
-        "note": f"Showing {len(cities_list)} cities. Use region/country filters for specific results."
+        "cached": False
     })
 
 @app.route('/api/cities/<path:city_name>')
 def get_city(city_name):
     """
-    Individual city endpoint - loads external data only for ONE city
+    Individual city endpoint - loads full details only when requested
     """
     city_name = unquote(city_name)
     
-    # Find city efficiently
-    city_info = CITY_BY_NAME.get(city_name.lower())
+    # Find city
+    city_info = None
+    for city in WORLD_CITIES:
+        if city['name'].lower() == city_name.lower():
+            city_info = city
+            break
+    
     if not city_info:
         return jsonify({
             "success": False,
             "error": f"City '{city_name}' not found"
         }), 404
     
-    # Cache individual city details
-    cache_key = f"city_details:{city_name}"
-    cached_data = cache.get(cache_key)
-    if cached_data:
-        return jsonify({
-            "success": True,
-            "data": cached_data,
-            "cached": True
-        })
-    
     try:
-        city_data = {
-            "id": city_info['name'].lower().replace(' ', '-'),
-            "name": city_info['name'],
-            "country": city_info.get('country'),
-            "region": city_info.get('region'),
-            "description": FastCityDataProvider.get_city_description(city_info['name'], city_info.get('country')),
-            "coordinates": FastCityDataProvider.get_coordinates(
-                city_info['name'], 
-                city_info.get('country'), 
-                city_info.get('region')
-            ),
-            "note": "Individual city pages can load more data on demand."
-        }
-        
-        # Cache the result
-        cache.set(cache_key, city_data)
+        city_data = data_provider.get_city_details(
+            city_info['name'],
+            city_info.get('country'),
+            city_info.get('region')
+        )
         
         return jsonify({
             "success": True,
-            "data": city_data,
-            "cached": False
+            "data": city_data
         })
         
     except Exception as e:
@@ -1592,7 +1787,7 @@ def get_city(city_name):
 
 @app.route('/api/search')
 def search_cities():
-    """Fast search endpoint"""
+    """Fast search endpoint with caching"""
     query = request.args.get('q', '').strip().lower()
     
     if len(query) < 2:
@@ -1604,57 +1799,46 @@ def search_cities():
     limit = request.args.get('limit', 20, type=int)
     limit = min(max(1, limit), 100)
     
+    # Check cache
+    cache_key = f"search:{query}:{limit}"
+    cached_results = cache.get(cache_key)
+    if cached_results:
+        return jsonify({
+            "success": True,
+            "query": query,
+            "count": len(cached_results),
+            "data": cached_results,
+            "cached": True
+        })
+    
     results = []
     
-    # Fast linear search (optimized for 1000+ cities)
+    # Simple linear search (optimized for 1000+ cities)
     for city in WORLD_CITIES:
         if query in city['name'].lower():
-            city_data = {
-                "id": city['name'].lower().replace(' ', '-'),
-                "name": city['name'],
-                "display_name": city['name'],
-                "description": FastCityDataProvider.get_city_description(city['name'], city.get('country')),
-                "image": FastImageProvider.get_city_image(city['name'], city.get('country'), city.get('region')),
-                "country": city.get('country'),
-                "region": city.get('region'),
-                "coordinates": FastCityDataProvider.get_coordinates(
-                    city['name'], 
-                    city.get('country'), 
+            try:
+                city_data = data_provider.get_city_preview(
+                    city['name'],
+                    city.get('country'),
                     city.get('region')
                 )
-            }
-            
-            results.append(city_data)
-            
-            if len(results) >= limit:
-                break
+                
+                results.append(city_data)
+                
+                if len(results) >= limit:
+                    break
+            except Exception:
+                continue
+    
+    # Cache search results
+    cache.set(cache_key, results, config.CACHE_TTL_PREVIEW)
     
     return jsonify({
         "success": True,
         "query": query,
         "count": len(results),
         "data": results,
-        "performance_mode": "instant_search"
-    })
-
-@app.route('/api/stats')
-def get_stats():
-    regions_count = len(REGIONS)
-    countries_count = len(CITIES_BY_COUNTRY)
-    
-    return jsonify({
-        "city_statistics": {
-            "total_cities_in_list": len(WORLD_CITIES),
-            "regions_available": regions_count,
-            "countries_available": countries_count,
-            "regions": REGIONS[:10] + ["..."] if len(REGIONS) > 10 else REGIONS
-        },
-        "performance_settings": {
-            "use_placeholder_images": config.USE_PLACEHOLDER_IMAGES,
-            "max_cities_per_request": config.MAX_CITIES_PER_REQUEST,
-            "cache_enabled": True
-        },
-        "mode": "ultra_fast_minimal_mode"
+        "cached": False
     })
 
 @app.errorhandler(404)
@@ -1674,12 +1858,13 @@ def internal_error(error):
 
 # ==================== STARTUP ====================
 if __name__ == '__main__':
-    logger.info("🚀 Starting City Explorer API in ULTRA-FAST MODE")
+    logger.info("🚀 Starting City Explorer API with OPTIMIZED CACHING")
     logger.info(f"📊 Total cities: {len(WORLD_CITIES)}")
     logger.info(f"📊 Unique regions: {len(REGIONS)}")
-    logger.info("✅ /api/cities returns data INSTANTLY with placeholder images")
-    logger.info("✅ No external API calls for city listings")
-    logger.info("✅ Individual city pages load external data on demand")
+    logger.info("✅ Region filtering enabled")
+    logger.info("✅ Smart caching enabled (memory, Redis, disk)")
+    logger.info("✅ Real Wikipedia images and descriptions")
+    logger.info("✅ Individual city details load on demand")
     
     port = int(os.environ.get('PORT', 5000))
     
@@ -1690,6 +1875,6 @@ if __name__ == '__main__':
         threaded=True
     )
 else:
-    logger.info("🔧 Running in serverless mode with ULTRA-FAST setup")
+    logger.info("🔧 Running in serverless mode with optimized caching")
     logger.info(f"📊 Found {len(WORLD_CITIES)} cities")
-    logger.info(f"📊 Pre-calculated {len(REGIONS)} regions")
+    logger.info(f"📊 Pre-built region/country indices for fast filtering")
