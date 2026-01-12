@@ -1,31 +1,26 @@
 {
   "functions": {
-    "api/index.py": {
-      "runtime": "python3.9",
-      "maxDuration": 30
+    "api/**/*.py": {
+      "runtime": "python3.9"
     }
   },
   "rewrites": [
     {
       "source": "/api/(.*)",
       "destination": "/api/index.py"
-    },
-    {
-      "source": "/(.*)",
-      "destination": "/api/index.py"
     }
   ],
   "headers": [
     {
-      "source": "/(.*)",
+      "source": "/api/(.*)",
       "headers": [
         {
           "key": "Access-Control-Allow-Origin",
-          "value": "https://www.traveltto.com https://traveltto.vercel.app"
+          "value": "https://www.traveltto.com https://traveltto.vercel.app http://localhost:3000"
         },
         {
           "key": "Access-Control-Allow-Methods",
-          "value": "GET, OPTIONS"
+          "value": "GET, POST, OPTIONS"
         },
         {
           "key": "Access-Control-Allow-Headers",
