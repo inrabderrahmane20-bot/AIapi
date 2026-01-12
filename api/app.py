@@ -5,449 +5,565 @@ import time
 import logging
 import hashlib
 from typing import List, Dict, Optional, Tuple, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from functools import wraps
+from datetime import datetime
 from urllib.parse import quote_plus, unquote
 import requests
-from flask import Flask, jsonify, request, Response
+import wikipediaapi
+import diskcache
+from geopy.geocoders import Nominatim
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dataclasses import dataclass, field
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import backoff
 
 # ==================== CONFIGURATION ====================
 @dataclass
 class Config:
-    # Your two allowed domains
-    ALLOWED_ORIGINS: List[str] = field(default_factory=lambda: [
-        "https://www.traveltto.com",
-        "https://traveltto.vercel.app",
-        "http://localhost:3000"
-    ])
+    CACHE_TTL: int = int(os.getenv("CACHE_TTL", "7200"))
+    CACHE_TTL_IMAGES: int = int(os.getenv("CACHE_TTL_IMAGES", "86400"))
+    CACHE_TTL_COORDS: int = int(os.getenv("CACHE_TTL_COORDS", "259200"))
     
-    # Cache TTLs
-    CACHE_TTL: int = 7200  # 2 hours
-    CACHE_TTL_IMAGES: int = 86400  # 24 hours
-    CACHE_TTL_PREVIEW: int = 3600  # 1 hour
+    MAX_IMAGES_PER_REQUEST: int = int(os.getenv("MAX_IMAGES_PER_REQUEST", "50"))
+    MAX_IMAGES_PREVIEW: int = 1
     
-    # Performance settings
-    REQUEST_TIMEOUT: int = 10
+    REQUEST_TIMEOUT: int = int(os.getenv("REQUEST_TIMEOUT", "15"))
+    WIKIPEDIA_TIMEOUT: int = int(os.getenv("WIKIPEDIA_TIMEOUT", "20"))
+    GEOLOCATOR_TIMEOUT: int = int(os.getenv("GEOLOCATOR_TIMEOUT", "10"))
     
-    # Pagination settings
-    CITIES_PER_PAGE: int = 50
+    FLASK_DEBUG: bool = os.getenv("FLASK_DEBUG", "false").lower() == "true"
+    FLASK_PORT: int = int(os.getenv("PORT", os.getenv("FLASK_PORT", "5000")))
     
-    # Client-side caching
-    ENABLE_CLIENT_CACHE: bool = True
-    CLIENT_CACHE_TTL: int = 86400  # 24 hours
+    CACHE_DIR: str = os.getenv("CACHE_DIR", "/tmp/city_explorer_cache")
     
-    # Logging
+    MAX_BATCH_SIZE: int = 50
+    MIN_IMAGE_WIDTH: int = 400
+    MIN_IMAGE_HEIGHT: int = 300
+    PREFERRED_IMAGE_FORMATS: List[str] = field(default_factory=lambda: ['.jpg', '.jpeg', '.png', '.webp'])
+    
+    MIN_IMAGE_QUALITY_SCORE: int = 40
+    
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
 config = Config()
 
-# ==================== LOGGING SETUP ====================
-logging.basicConfig(
-    level=getattr(logging, config.LOG_LEVEL.upper()),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# ==================== LOGGING ====================
+class ColorFormatter(logging.Formatter):
+    grey = "\x1b[38;21m"
+    yellow = "\x1b[33;21m"
+    red = "\x1b[31;21m"
+    bold_red = "\x1b[31;1m"
+    reset = "\x1b[0m"
+    
+    FORMATS = {
+        logging.DEBUG: grey + "%(asctime)s - %(levelname)s - %(message)s" + reset,
+        logging.INFO: grey + "%(asctime)s - %(levelname)s - %(message)s" + reset,
+        logging.WARNING: yellow + "%(asctime)s - %(levelname)s - %(message)s" + reset,
+        logging.ERROR: red + "%(asctime)s - %(levelname)s - %(message)s" + reset,
+        logging.CRITICAL: bold_red + "%(asctime)s - %(levelname)s - %(message)s" + reset
+    }
+    
+    def format(self, record):
+        log_fmt = self.FORMATS.get(record.levelno)
+        formatter = logging.Formatter(log_fmt)
+        return formatter.format(record)
+
 logger = logging.getLogger("CityExplorer")
+logger.setLevel(getattr(logging, config.LOG_LEVEL.upper(), logging.INFO))
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(ColorFormatter())
+logger.addHandler(console_handler)
+
+logger.info("🚀 City Explorer API Initializing...")
+
+# ==================== CORS ORIGIN CHECK ====================
+ALLOWED_ORIGINS = ["https://www.traveltto.com", "https://traveltto.vercel.app"]
+
+def check_origin():
+    """Middleware to check origin"""
+    origin = request.headers.get('Origin')
+    if origin and origin not in ALLOWED_ORIGINS:
+        logger.warning(f"Blocked request from unauthorized origin: {origin}")
+        return jsonify({"error": "Unauthorized origin"}), 403
+    return None
 
 # ==================== CACHING SYSTEM ====================
-class Cache:
+class MultiLevelCache:
     def __init__(self):
         self.memory_cache = {}
+        self.disk_cache = None
+        
+        try:
+            os.makedirs(config.CACHE_DIR, exist_ok=True)
+            self.disk_cache = diskcache.Cache(config.CACHE_DIR)
+            logger.info(f"✅ Disk cache initialized at: {config.CACHE_DIR}")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to initialize disk cache: {e}")
+            self.disk_cache = diskcache.Cache()
     
-    def get(self, key: str):
+    def get(self, key: str, default=None):
         if key in self.memory_cache:
-            item = self.memory_cache[key]
-            if time.time() - item.get('timestamp', 0) < config.CACHE_TTL:
+            item = self.memory_cache.get(key)
+            if item and time.time() - item.get('timestamp', 0) < config.CACHE_TTL:
                 return item.get('value')
-        return None
+        
+        if self.disk_cache:
+            try:
+                cached = self.disk_cache.get(key)
+                if cached and time.time() - cached.get('timestamp', 0) < config.CACHE_TTL:
+                    self.memory_cache[key] = cached
+                    return cached.get('value')
+            except Exception:
+                pass
+        
+        return default
     
     def set(self, key: str, value: Any, ttl: int = None):
-        item = {
+        cache_item = {
             'value': value,
             'timestamp': time.time()
         }
-        self.memory_cache[key] = item
+        
+        self.memory_cache[key] = cache_item
+        
+        if self.disk_cache:
+            try:
+                self.disk_cache.set(key, cache_item, expire=ttl or config.CACHE_TTL)
+            except Exception:
+                pass
     
     def delete(self, key: str):
-        self.memory_cache.pop(key, None)
+        if key in self.memory_cache:
+            del self.memory_cache[key]
+        
+        if self.disk_cache:
+            try:
+                del self.disk_cache[key]
+            except Exception:
+                pass
 
-cache = Cache()
+cache = MultiLevelCache()
+
+# ==================== REQUEST HANDLER ====================
+class SmartRequestHandler:
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (compatible; CityExplorer/2.0; +https://traveltto.com)',
+            'Accept': 'application/json',
+            'Accept-Language': 'en-US,en;q=0.9'
+        })
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((requests.exceptions.Timeout, 
+                                       requests.exceptions.ConnectionError))
+    )
+    def get_with_retry(self, url: str, params: dict = None, headers: dict = None, 
+                       timeout: int = None) -> requests.Response:
+        try:
+            response = self.session.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=timeout or config.REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+            return response
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request failed for {url}: {e}")
+            raise
+    
+    def get_json_cached(self, url: str, params: dict = None, headers: dict = None, 
+                        cache_key: str = None, ttl: int = None) -> Any:
+        if not cache_key:
+            cache_key = hashlib.md5(
+                f"{url}{json.dumps(params or {}, sort_keys=True)}".encode()
+            ).hexdigest()
+        
+        cached = cache.get(cache_key)
+        if cached is not None:
+            logger.debug(f"Cache hit for {url}")
+            return cached
+        
+        try:
+            response = self.get_with_retry(url, params, headers)
+            data = response.json()
+            
+            cache.set(cache_key, data, ttl or config.CACHE_TTL)
+            
+            return data
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch {url}: {e}")
+            
+            if cached is not None:
+                logger.info(f"Using stale cache for {url}")
+                return cached
+            
+            raise
+
+request_handler = SmartRequestHandler()
 
 # ==================== IMAGE FETCHER ====================
-class ImageFetcher:
+class IntelligentImageFetcher:
     def __init__(self):
         self.wikimedia_api = "https://commons.wikimedia.org/w/api.php"
         self.wikipedia_api = "https://en.wikipedia.org/w/api.php"
+        
+    def calculate_image_quality(self, image_info: dict) -> int:
+        score = 50
+        
+        width = image_info.get('width', 0)
+        height = image_info.get('height', 0)
+        if width >= 1200 and height >= 800:
+            score += 30
+        elif width >= 800 and height >= 600:
+            score += 20
+        elif width >= 400 and height >= 300:
+            score += 10
+        
+        url = image_info.get('url', '').lower()
+        if any(fmt in url for fmt in ['.jpg', '.jpeg']):
+            score += 5
+        
+        return min(100, max(0, score))
     
-    def get_city_image(self, city_name: str, country: str = None) -> Dict:
-        """Get one representative image for a city"""
-        cache_key = f"city_image:{city_name}:{country}"
+    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=2, max=5))
+    def fetch_from_wikimedia(self, query: str, limit: int = 20) -> List[Dict]:
+        images = []
+        
+        try:
+            search_query = f'{query}'
+            
+            params = {
+                'action': 'query',
+                'generator': 'search',
+                'gsrsearch': search_query,
+                'gsrnamespace': '6',
+                'gsrlimit': limit * 2,
+                'prop': 'imageinfo',
+                'iiprop': 'url|size|mime|extmetadata',
+                'iiurlwidth': 800,
+                'format': 'json'
+            }
+            
+            data = request_handler.get_json_cached(
+                self.wikimedia_api,
+                params=params,
+                cache_key=f"wikimedia:{search_query}",
+                ttl=config.CACHE_TTL_IMAGES
+            )
+            
+            for page in data.get('query', {}).get('pages', {}).values():
+                if 'imageinfo' in page:
+                    info = page['imageinfo'][0]
+                    
+                    if self._is_relevant_image(info, query):
+                        image_data = {
+                            'url': info.get('thumburl') or info.get('url'),
+                            'title': page.get('title', '').replace('File:', ''),
+                            'description': self._extract_description(info),
+                            'source': 'wikimedia',
+                            'width': info.get('width'),
+                            'height': info.get('height'),
+                            'quality_score': self.calculate_image_quality(info),
+                            'page_url': f"https://commons.wikimedia.org/wiki/{page.get('title', '')}"
+                        }
+                        
+                        if image_data['url'] and image_data['quality_score'] >= config.MIN_IMAGE_QUALITY_SCORE:
+                            images.append(image_data)
+                            
+                            if len(images) >= limit:
+                                break
+            
+            images.sort(key=lambda x: x.get('quality_score', 0), reverse=True)
+            
+        except Exception as e:
+            logger.warning(f"Wikimedia fetch failed for {query}: {e}")
+        
+        return images[:limit]
+    
+    def fetch_landmark_image(self, landmark_name: str) -> Optional[Dict]:
+        """Fetch image for a specific landmark"""
+        cache_key = f"landmark_image:{landmark_name}"
+        
         cached = cache.get(cache_key)
         if cached:
             return cached
         
-        # Always use placeholder for speed
-        image = self._get_placeholder_image(city_name)
-        cache.set(cache_key, image, 3600)
-        return image
+        try:
+            images = self.fetch_from_wikimedia(landmark_name, limit=5)
+            if images:
+                # Get the best quality image
+                best_image = max(images, key=lambda x: x.get('quality_score', 0))
+                cache.set(cache_key, best_image, config.CACHE_TTL_IMAGES)
+                return best_image
+        except Exception as e:
+            logger.debug(f"Landmark image fetch failed for {landmark_name}: {e}")
+        
+        return None
     
-    def get_landmark_images(self, landmark_name: str, city_name: str = None) -> List[Dict]:
-        """Get images for a specific landmark"""
-        cache_key = f"landmark_images:{landmark_name}:{city_name}"
+    def get_one_representative_image(self, city_name: str) -> Optional[Dict]:
+        """Get ONLY ONE representative image for city preview"""
+        cache_key = f"one_image:{city_name}"
+        
         cached = cache.get(cache_key)
         if cached:
             return cached
         
-        # Use placeholder for speed
-        images = [self._get_placeholder_image(landmark_name)]
-        cache.set(cache_key, images, config.CACHE_TTL_IMAGES)
-        return images
-    
-    def _get_placeholder_image(self, name: str) -> Dict:
-        """Generate a placeholder image URL"""
-        encoded_name = quote_plus(name[:30])
-        colors = ['3388ff', 'ff5733', '33ff57', 'ff33a1', 'a133ff']
-        color = colors[hash(name) % len(colors)]
+        try:
+            # Try to get one good city image
+            all_images = self.fetch_from_wikimedia(city_name, limit=3)
+            if all_images:
+                # Pick the best quality image
+                best_image = max(all_images, key=lambda x: x.get('quality_score', 0))
+                cache.set(cache_key, best_image, config.CACHE_TTL_IMAGES)
+                return best_image
+                
+        except Exception as e:
+            logger.debug(f"Single image fetch failed: {e}")
         
-        return {
-            'url': f'https://via.placeholder.com/800x600/{color}/ffffff?text={encoded_name}',
-            'title': name,
-            'description': f'Image of {name}',
-            'source': 'placeholder',
-            'width': 800,
-            'height': 600,
-            'is_placeholder': True
-        }
+        return None
+    
+    def get_images_for_city(self, city_name: str, limit: int = None) -> List[Dict]:
+        """Get multiple images for a city (for details page)"""
+        limit = limit or config.MAX_IMAGES_PER_REQUEST
+        
+        try:
+            images = self.fetch_from_wikimedia(city_name, limit)
+            return images[:limit]
+        except Exception as e:
+            logger.warning(f"Images fetch failed for {city_name}: {e}")
+            return []
+    
+    def _is_relevant_image(self, image_info: dict, query: str) -> bool:
+        mime = image_info.get('mime', '')
+        width = image_info.get('width', 0)
+        height = image_info.get('height', 0)
+        url = image_info.get('url', '').lower()
+        
+        if not mime.startswith('image/'):
+            return False
+        
+        if width < config.MIN_IMAGE_WIDTH or height < config.MIN_IMAGE_HEIGHT:
+            return False
+        
+        if not any(fmt in url for fmt in config.PREFERRED_IMAGE_FORMATS):
+            return False
+        
+        return True
+    
+    def _extract_description(self, image_info: dict) -> str:
+        extmetadata = image_info.get('extmetadata', {})
+        
+        for field in ['ImageDescription', 'ObjectName', 'Caption']:
+            if field in extmetadata:
+                value = extmetadata[field].get('value', '')
+                if isinstance(value, str) and value.strip():
+                    clean_value = re.sub(r'<[^>]+>', '', value)
+                    return clean_value[:200]  # Limit description length
+        
+        return ""
 
-image_fetcher = ImageFetcher()
+image_fetcher = IntelligentImageFetcher()
 
-# ==================== CITY DATA PROVIDER ====================
-class CityDataProvider:
+# ==================== WIKIPEDIA DATA PROVIDER ====================
+class WikipediaDataProvider:
     def __init__(self):
-        self.city_descriptions = self._load_city_descriptions()
-        self.city_coordinates = self._load_city_coordinates()
-    
-    def _load_city_coordinates(self) -> Dict:
-        """Coordinates for Moroccan cities"""
-        return {
-            "Marrakech": {"lat": 31.6295, "lon": -7.9811},
-            "Casablanca": {"lat": 33.5731, "lon": -7.5898},
-            "Fez": {"lat": 34.0181, "lon": -5.0078},
-            "Tangier": {"lat": 35.7595, "lon": -5.8340},
-            "Rabat": {"lat": 34.0209, "lon": -6.8416},
-            "Agadir": {"lat": 30.4278, "lon": -9.5981},
-            "Meknes": {"lat": 33.8935, "lon": -5.5473},
-            "Oujda": {"lat": 34.6819, "lon": -1.9086},
-            "Kenitra": {"lat": 34.2541, "lon": -6.5890},
-            "Tetouan": {"lat": 35.5762, "lon": -5.3684},
-            "Safi": {"lat": 32.2833, "lon": -9.2333},
-            "El Jadida": {"lat": 33.2568, "lon": -8.5088},
-            "Nador": {"lat": 35.1686, "lon": -2.9333},
-            "Settat": {"lat": 33.0010, "lon": -7.6166},
-            "Beni Mellal": {"lat": 32.3373, "lon": -6.3498},
-            "Khourigba": {"lat": 32.8800, "lon": -6.9060},
-            "Al Hoceima": {"lat": 35.2510, "lon": -3.9373},
-            "Larache": {"lat": 35.1918, "lon": -6.1557},
-            "Taza": {"lat": 34.2234, "lon": -4.0066},
-            "Errachidia": {"lat": 31.9319, "lon": -4.4246},
-            "Taroudant": {"lat": 30.4720, "lon": -8.8749},
-            "Essaouira": {"lat": 31.5085, "lon": -9.7595},
-            "Chefchaouen": {"lat": 35.1714, "lon": -5.2699},
-            "Ouarzazate": {"lat": 30.9335, "lon": -6.9370},
-            "Ifrane": {"lat": 33.5260, "lon": -5.1106},
-            "Azrou": {"lat": 33.4342, "lon": -5.2213},
-            "Midelt": {"lat": 32.6805, "lon": -4.7361},
-            "Guelmim": {"lat": 28.9884, "lon": -10.0528},
-            "Dakhla": {"lat": 23.7141, "lon": -15.9368},
-            "Laayoune": {"lat": 27.1253, "lon": -13.1625},
-            "Asilah": {"lat": 35.4662, "lon": -6.0404},
-            "Sidi Ifni": {"lat": 29.3792, "lon": -10.1750},
-            "Tiznit": {"lat": 29.6974, "lon": -9.7316},
-            "Khenifra": {"lat": 32.9395, "lon": -5.6675},
-            "Berkane": {"lat": 34.9172, "lon": -2.3197},
-            "Taourirt": {"lat": 34.4073, "lon": -2.8978},
-            "Figuig": {"lat": 32.1097, "lon": -1.2284},
-            "Sidi Kacem": {"lat": 34.2266, "lon": -5.7066},
-            "Skhirat": {"lat": 33.8524, "lon": -7.0317},
-            "Temara": {"lat": 33.9274, "lon": -6.9160},
-            "Mohammedia": {"lat": 33.6879, "lon": -7.3829},
-            "Ben Guerir": {"lat": 32.2314, "lon": -7.9526},
-            "Tifelt": {"lat": 33.8948, "lon": -6.3094},
-            "Bouznika": {"lat": 33.7894, "lon": -7.1596},
-            "M'diq": {"lat": 35.6855, "lon": -5.3206},
-            "Fnideq": {"lat": 35.8486, "lon": -5.3575},
-            "Martil": {"lat": 35.6098, "lon": -5.2755},
-            "Berrechid": {"lat": 33.2602, "lon": -7.5826},
-            "Sidi Bennour": {"lat": 32.6523, "lon": -8.4277},
-            "Youssoufia": {"lat": 32.2463, "lon": -8.5290},
-            "Jerada": {"lat": 34.3102, "lon": -2.1630},
-            "Oulad Teima": {"lat": 30.3950, "lon": -9.2086},
-            "Benslimane": {"lat": 33.6115, "lon": -7.1216},
-            "Ait Melloul": {"lat": 30.3342, "lon": -9.4972},
-            "Sidi Slimane": {"lat": 34.2642, "lon": -5.9254},
-            "Tan-Tan": {"lat": 28.4371, "lon": -11.1034},
-            "Ouezzane": {"lat": 34.7956, "lon": -5.5780},
-            "Sefrou": {"lat": 33.8304, "lon": -4.8351},
-            "Boulemane": {"lat": 33.3625, "lon": -4.7303},
-            "Taounate": {"lat": 34.5361, "lon": -4.6400},
-            "Goulmima": {"lat": 31.6826, "lon": -4.9548},
-            "Midar": {"lat": 34.9392, "lon": -3.5325},
-            "Zagora": {"lat": 30.3316, "lon": -5.8376},
-            "Sidi Yahya Zaer": {"lat": 33.6667, "lon": -6.7167},
-        }
-    
-    def _load_city_descriptions(self) -> Dict:
-        """Descriptions for all cities starting with 'About the city:'"""
-        return {
-            # Moroccan Cities
-            "Marrakech": "About the city: Known as the 'Red City' for its distinctive red sandstone buildings, Marrakech is a vibrant cultural hub famous for its historic medina, bustling souks, and the iconic Jemaa el-Fnaa square.",
-            "Casablanca": "About the city: Morocco's largest city and economic capital, Casablanca is a modern metropolis famous for its stunning Hassan II Mosque, art deco architecture, and vibrant seaside corniche.",
-            "Fez": "About the city: The spiritual and cultural capital of Morocco, Fez is home to the world's oldest university and a UNESCO-listed medina that preserves centuries of Islamic architecture and traditional craftsmanship.",
-            "Tangier": "About the city: A historic port city straddling Africa and Europe, Tangier has long attracted artists and writers with its unique blend of Moroccan, European, and African influences.",
-            "Rabat": "About the city: Morocco's political and administrative capital, Rabat features historic sites like the Hassan Tower and Kasbah of the Udayas alongside modern government buildings.",
-            "Agadir": "About the city: A modern beach resort city on Morocco's southern Atlantic coast, Agadir is famous for its beautiful beaches, modern marina, and year-round sunshine.",
-            "Meknes": "About the city: Once the imperial capital of Morocco under Sultan Moulay Ismail, Meknes is known for its grand gates, extensive royal stables, and well-preserved historic monuments.",
-            "Essaouira": "About the city: A charming coastal town known for its fortified medina, fresh seafood, and strong winds that make it a paradise for windsurfers and kitesurfers.",
-            "Chefchaouen": "About the city: The famous 'Blue City' nestled in the Rif Mountains, Chefchaouen is renowned for its striking blue-washed buildings, relaxed atmosphere, and stunning mountain scenery.",
-            "Ouarzazate": "About the city: Known as the 'Door of the Desert', Ouarzazate serves as a gateway to the Sahara and is famous for its kasbahs and as a filming location for Hollywood movies.",
-            "Oujda": "About the city: The capital of eastern Morocco, Oujda is known for its Andalusian-influenced architecture and strategic location near the Algerian border.",
-            "Kenitra": "About the city: A major port city on the Sebou River, Kenitra is an important industrial and agricultural center with modern infrastructure.",
-            "Tetouan": "About the city: Known for its distinctive white architecture and strong Spanish influence, Tetouan features a UNESCO-listed medina with well-preserved Andalusian heritage.",
-            "Safi": "About the city: A historic port city famous for its pottery and ceramics, Safi has been a center for craftsmanship since the 11th century.",
-            "El Jadida": "About the city: A coastal city known for its Portuguese fortifications and the unique underground cistern, part of a UNESCO World Heritage site.",
-            "Nador": "About the city: A port city on the Mediterranean coast near the Spanish enclave of Melilla, known for its beautiful lagoon and beaches.",
-            "Settat": "About the city: An important agricultural and commercial center located between Casablanca and Marrakech.",
-            "Beni Mellal": "About the city: The economic capital of the Tadla-Azilal region, known for its fertile plains and the nearby Ain Asserdoun springs.",
-            "Khourigba": "About the city: The center of Morocco's phosphate mining industry, located in the phosphate plateau region.",
-            "Al Hoceima": "About the city: A picturesque Mediterranean port city in the Rif Mountains, known for its beautiful beaches and Spanish colonial architecture.",
-            "Larache": "About the city: A historic Atlantic port city with Spanish influences and important archaeological sites nearby.",
-            "Taza": "About the city: A strategic mountain city guarding the pass between the Rif and Middle Atlas mountains.",
-            "Errachidia": "About the city: The capital of the Draa-Tafilalet region, serving as gateway to the Sahara Desert and its stunning oases.",
-            "Taroudant": "About the city: Known as 'Little Marrakech', this walled city features impressive ramparts and a traditional souk atmosphere.",
-            "Ifrane": "About the city: A unique mountain resort town often called 'Little Switzerland' for its alpine architecture and clean streets.",
-            "Azrou": "About the city: A Berber town in the Middle Atlas known for its cedar forests, handicrafts, and weekly markets.",
-            "Midelt": "About the city: A market town in the Atlas Mountains known as the 'apple capital' of Morocco and gateway to the desert.",
-            "Guelmim": "About the city: Known as the 'Gateway to the Sahara', famous for its camel market and desert landscapes.",
-            "Dakhla": "About the city: A coastal city in Western Sahara known for its excellent kitesurfing conditions and oyster farming.",
-            "Laayoune": "About the city: The largest city in Western Sahara, known for its modern architecture and desert surroundings.",
-            "Asilah": "About the city: A charming coastal town famous for its annual arts festival, whitewashed buildings, and historic ramparts.",
-            "Sidi Ifni": "About the city: A former Spanish enclave known for its art deco architecture and beautiful beaches along the Atlantic coast.",
-            "Tiznit": "About the city: A historic walled city famous for its silver jewelry, traditional crafts, and annual festival.",
-            "Khenifra": "About the city: A city in the Middle Atlas known for its Berber heritage, beautiful lakes, and traditional carpet weaving.",
-            "Berkane": "About the city: Known as the 'Orange Capital' of Morocco, famous for its citrus production and agricultural wealth.",
-            "Taourirt": "About the city: A city in eastern Morocco known for its historic kasbah and strategic location on trade routes.",
-            "Figuig": "About the city: An oasis city on the Algerian border, famous for its date palms and traditional mud-brick architecture.",
-            "Sidi Kacem": "About the city: An important railway junction and agricultural center in northwestern Morocco.",
-            "Skhirat": "About the city: A coastal town near Rabat known for its royal palace and beautiful beaches.",
-            "Temara": "About the city: A suburb of Rabat known for its beaches, modern developments, and recreational facilities.",
-            "Mohammedia": "About the city: A port city and industrial center with beautiful beaches and the largest oil refinery in Morocco.",
-            "Ben Guerir": "About the city: Known for its phosphate mines and recent development as a university and technology hub.",
-            "Tifelt": "About the city: A town in the Rabat-Salé-Kénitra region known for its agricultural production and traditional markets.",
-            "Bouznika": "About the city: A coastal resort town between Rabat and Casablanca, popular for its beaches and summer festivals.",
-            "M'diq": "About the city: A Mediterranean port town known for its fishing harbor and tourist facilities.",
-            "Fnideq": "About the city: A border town near Ceuta, known for its shopping markets and cross-border trade.",
-            "Martil": "About the city: A popular beach resort town near Tetouan with beautiful sandy beaches and waterfront promenade.",
-            "Berrechid": "About the city: An industrial and agricultural city known for its food processing industries and agricultural markets.",
-            "Sidi Bennour": "About the city: An agricultural town in the Casablanca-Settat region known for its sugar production and farming.",
-            "Youssoufia": "About the city: A mining town in central Morocco known for its phosphate extraction and industrial facilities.",
-            "Jerada": "About the city: A former mining town in northeastern Morocco, now focusing on renewable energy projects.",
-            "Oulad Teima": "About the city: An agricultural town in the Souss-Massa region known for its argan oil production and markets.",
-            "Benslimane": "About the city: A town known for its eucalyptus forests, agricultural production, and pleasant climate.",
-            "Ait Melloul": "About the city: A suburb of Agadir known for its agricultural markets and proximity to the airport.",
-            "Sidi Slimane": "About the city: An agricultural town in the Gharb region known for its sugar refinery and farming.",
-            "Tan-Tan": "About the city: A city in southern Morocco known for its annual moussem (festival) and desert culture.",
-            "Ouezzane": "About the city: A spiritual city in northwestern Morocco known for its religious heritage and olive production.",
-            "Sefrou": "About the city: Known as the 'City of Cherries', famous for its annual cherry festival and historic medina.",
-            "Boulemane": "About the city: A town in the Middle Atlas known for its pastoral landscapes and traditional Berber culture.",
-            "Taounate": "About the city: A town in the Fès-Meknès region known for its olive oil production and agricultural terraces.",
-            "Goulmima": "About the city: An oasis town in southeastern Morocco known for its ksar (fortified village) and date production.",
-            "Midar": "About the city: A town in the Rif Mountains known for its agricultural markets and traditional crafts.",
-            "Zagora": "About the city: A desert town famous as the starting point for camel treks into the Sahara Desert.",
-            "Sidi Yahya Zaer": "About the city: A town in the Rabat region known for its agricultural production and rural landscapes.",
-        }
-    
-    def get_city_preview(self, city_name: str, country: str = None, region: str = None) -> Dict:
-        """Get minimal preview data for city listing"""
-        cache_key = f"preview:{city_name}:{country}"
-        cached = cache.get(cache_key)
-        if cached:
-            return cached
-        
-        # Generate city ID
-        city_id = re.sub(r'[^\w\s-]', '', city_name.lower())
-        city_id = re.sub(r'[-\s]+', '-', city_id)
-        
-        # Get coordinates
-        coordinates = self.city_coordinates.get(city_name, None)
-        
-        # Get image
-        image = image_fetcher.get_city_image(city_name, country)
-        
-        # Get description
-        description = self.city_descriptions.get(
-            city_name, 
-            f"About the city: {city_name} is a significant city in {country or 'Morocco'}, known for its unique culture and historical importance."
+        self.wiki = wikipediaapi.Wikipedia(
+            language='en',
+            user_agent='CityExplorer/2.0 (https://traveltto.com)',
+            extract_format=wikipediaapi.ExtractFormat.WIKI
         )
-        
-        preview = {
-            "id": city_id,
-            "name": city_name,
-            "country": country,
-            "region": region,
-            "coordinates": coordinates,
-            "image": image,
-            "summary": description,
-            "has_details": False
-        }
-        
-        cache.set(cache_key, preview, config.CACHE_TTL_PREVIEW)
-        return preview
     
-    def get_city_details(self, city_name: str, country: str = None, region: str = None) -> Dict:
-        """Get full details for a city"""
-        cache_key = f"details:{city_name}:{country}"
+    def get_city_summary(self, city_name: str) -> Tuple[Optional[str], Optional[str]]:
+        """Get short summary for a city"""
+        cache_key = f"wiki_summary:{city_name}"
+        
+        cached = cache.get(cache_key)
+        if cached:
+            return cached.get('summary'), cached.get('title')
+        
+        try:
+            page = self.wiki.page(city_name)
+            
+            if page.exists():
+                summary = page.summary or ""
+                if summary:
+                    # Get first 2-3 sentences max
+                    sentences = re.split(r'[.!?]', summary)
+                    short_summary = ""
+                    sentence_count = 0
+                    for sentence in sentences:
+                        if sentence.strip():
+                            short_summary += sentence.strip() + '. '
+                            sentence_count += 1
+                            if sentence_count >= 3:
+                                break
+                    
+                    short_summary = short_summary.strip()
+                    if short_summary:
+                        cache.set(cache_key, {
+                            'summary': short_summary,
+                            'title': page.title
+                        }, config.CACHE_TTL)
+                        return short_summary, page.title
+        except Exception as e:
+            logger.debug(f"Wikipedia summary failed for {city_name}: {e}")
+        
+        return None, None
+    
+    def extract_landmarks(self, city_name: str) -> List[Dict]:
+        """Extract landmarks from Wikipedia page"""
+        cache_key = f"landmarks:{city_name}"
+        
         cached = cache.get(cache_key)
         if cached:
             return cached
         
-        # Start with preview
-        preview = self.get_city_preview(city_name, country, region)
+        landmarks = []
         
-        # Get landmarks
-        landmarks = self._get_landmarks(city_name)
+        try:
+            page = self.wiki.page(city_name)
+            
+            if page.exists():
+                # Look for landmarks section
+                for section in page.sections:
+                    section_title = section.title.lower()
+                    section_text = section.text.lower()
+                    
+                    # Check if this section might contain landmarks
+                    if any(keyword in section_title for keyword in ['landmark', 'attraction', 'architecture', 'monument', 'tourism', 'sight']):
+                        # Extract potential landmarks
+                        lines = section.text.split('\n')
+                        for line in lines:
+                            line = line.strip()
+                            if len(line) > 30 and not line.startswith('=='):
+                                # This could be a landmark description
+                                landmark_name = self._extract_landmark_name(line)
+                                if landmark_name:
+                                    landmarks.append({
+                                        'name': landmark_name,
+                                        'description': line[:150] + '...' if len(line) > 150 else line,
+                                        'raw_text': line
+                                    })
+                
+                # If no landmarks found in specific sections, check the summary
+                if not landmarks and page.summary:
+                    summary = page.summary
+                    # Look for notable mentions
+                    sentences = summary.split('.')
+                    for sentence in sentences:
+                        sentence = sentence.strip()
+                        if len(sentence) > 40 and any(word in sentence.lower() for word in ['famous', 'known for', 'notable', 'popular', 'major']):
+                            landmark_name = self._extract_landmark_name(sentence)
+                            if landmark_name:
+                                landmarks.append({
+                                    'name': landmark_name,
+                                    'description': sentence[:150] + '...' if len(sentence) > 150 else sentence,
+                                    'raw_text': sentence
+                                })
+            
+            # Limit to 10 landmarks max
+            landmarks = landmarks[:10]
+            
+            # Fetch images for each landmark
+            for landmark in landmarks:
+                landmark_name = landmark['name']
+                image = image_fetcher.fetch_landmark_image(landmark_name)
+                if image:
+                    landmark['image'] = image
+            
+            cache.set(cache_key, landmarks, config.CACHE_TTL)
+            
+        except Exception as e:
+            logger.debug(f"Landmarks extraction failed for {city_name}: {e}")
         
-        # Build full details
-        details = {
-            **preview,
-            "description": preview["summary"],  # Use the same description for now
-            "landmarks": landmarks,
-            "additional_images": [],
-            "has_details": True,
-            "last_updated": time.time()
-        }
-        
-        cache.set(cache_key, details, config.CACHE_TTL)
-        return details
+        return landmarks
     
-    def _get_landmarks(self, city_name: str) -> List[Dict]:
-        """Get landmarks for a city"""
-        landmarks_data = {
-            "Marrakech": [
-                {"name": "Jemaa el-Fnaa", "description": "The main square and market place in Marrakech's medina."},
-                {"name": "Bahia Palace", "description": "A masterpiece of Moroccan architecture from the 19th century."},
-                {"name": "Koutoubia Mosque", "description": "The largest mosque in Marrakech with a 77-meter minaret."},
-                {"name": "Saadian Tombs", "description": "Historical burial ground of the Saadian dynasty."},
-                {"name": "Majorelle Garden", "description": "A botanical garden created by French painter Jacques Majorelle."}
-            ],
-            "Casablanca": [
-                {"name": "Hassan II Mosque", "description": "The largest mosque in Africa with a minaret 210 meters high."},
-                {"name": "Old Medina", "description": "The historic heart of Casablanca with traditional markets."},
-                {"name": "Corniche", "description": "A seaside promenade with beaches, restaurants, and clubs."},
-                {"name": "Mohammed V Square", "description": "The main square surrounded by important public buildings."},
-                {"name": "Sacred Heart Cathedral", "description": "A former Catholic cathedral in art deco style."}
-            ],
-            "Fez": [
-                {"name": "Fes el Bali", "description": "The oldest walled part of Fez, a UNESCO World Heritage site."},
-                {"name": "Al-Qarawiyyin University", "description": "Founded in 859, it's the oldest continuously operating university in the world."},
-                {"name": "Bou Inania Madrasa", "description": "A 14th-century Islamic school and mosque."},
-                {"name": "Chouara Tannery", "description": "One of the oldest tanneries in the world, operating since the 11th century."},
-                {"name": "Royal Palace", "description": "The ceremonial palace of the King of Morocco in Fez."}
-            ],
-            "Rabat": [
-                {"name": "Hassan Tower", "description": "An incomplete minaret of what was intended to be the world's largest mosque."},
-                {"name": "Kasbah of the Udayas", "description": "A fortified city with Andalusian gardens and blue-white walls."},
-                {"name": "Chellah", "description": "A medieval fortified Muslim necropolis with Roman ruins."},
-                {"name": "Royal Palace", "description": "The primary and official residence of the king of Morocco."},
-                {"name": "Mohammed V Mausoleum", "description": "The final resting place of Moroccan kings."}
-            ]
-        }
+    def _extract_landmark_name(self, text: str) -> str:
+        """Extract a likely landmark name from text"""
+        # Remove common prefixes and clean up
+        text = text.strip()
         
-        if city_name in landmarks_data:
-            return landmarks_data[city_name]
+        # Look for quoted names
+        match = re.search(r'"([^"]+)"', text)
+        if match:
+            return match.group(1)
         
-        # Generic landmarks for other cities
-        generic_landmarks = [
-            {"name": "Historic Medina", "description": f"The traditional old town of {city_name} with narrow streets and markets."},
-            {"name": "Main Square", "description": f"The central gathering place and social hub of {city_name}."},
-            {"name": "Local Museum", "description": f"A museum showcasing the history and culture of {city_name}."},
-            {"name": "Traditional Market", "description": f"A bustling market offering local products and crafts."},
-            {"name": "City Park", "description": f"A green space for relaxation and recreation in {city_name}."}
-        ]
+        # Look for names starting with capital letters
+        words = text.split()
+        if len(words) > 0:
+            # Take the first few words that start with capital letters
+            name_parts = []
+            for word in words[:4]:  # Limit to first 4 words
+                if word and word[0].isupper():
+                    name_parts.append(word)
+                else:
+                    break
+            
+            if name_parts:
+                return ' '.join(name_parts)
         
-        return generic_landmarks[:3]
+        # Fallback: first 3 words
+        return ' '.join(words[:3]) if len(words) >= 3 else text[:50]
 
-city_provider = CityDataProvider()
+wikipedia_provider = WikipediaDataProvider()
 
-# ==================== DATA ====================
-# Moroccan Cities (70+ cities)
-MOROCCAN_CITIES = [
-    {"name": "Marrakech", "country": "Morocco", "region": "Africa"},
-    {"name": "Casablanca", "country": "Morocco", "region": "Africa"},
-    {"name": "Fez", "country": "Morocco", "region": "Africa"},
-    {"name": "Tangier", "country": "Morocco", "region": "Africa"},
-    {"name": "Rabat", "country": "Morocco", "region": "Africa"},
-    {"name": "Agadir", "country": "Morocco", "region": "Africa"},
-    {"name": "Meknes", "country": "Morocco", "region": "Africa"},
-    {"name": "Oujda", "country": "Morocco", "region": "Africa"},
-    {"name": "Kenitra", "country": "Morocco", "region": "Africa"},
-    {"name": "Tetouan", "country": "Morocco", "region": "Africa"},
-    {"name": "Safi", "country": "Morocco", "region": "Africa"},
-    {"name": "El Jadida", "country": "Morocco", "region": "Africa"},
-    {"name": "Nador", "country": "Morocco", "region": "Africa"},
-    {"name": "Settat", "country": "Morocco", "region": "Africa"},
-    {"name": "Beni Mellal", "country": "Morocco", "region": "Africa"},
-    {"name": "Khourigba", "country": "Morocco", "region": "Africa"},
-    {"name": "Al Hoceima", "country": "Morocco", "region": "Africa"},
-    {"name": "Larache", "country": "Morocco", "region": "Africa"},
-    {"name": "Taza", "country": "Morocco", "region": "Africa"},
-    {"name": "Errachidia", "country": "Morocco", "region": "Africa"},
-    {"name": "Taroudant", "country": "Morocco", "region": "Africa"},
-    {"name": "Essaouira", "country": "Morocco", "region": "Africa"},
-    {"name": "Chefchaouen", "country": "Morocco", "region": "Africa"},
-    {"name": "Ouarzazate", "country": "Morocco", "region": "Africa"},
-    {"name": "Ifrane", "country": "Morocco", "region": "Africa"},
-    {"name": "Azrou", "country": "Morocco", "region": "Africa"},
-    {"name": "Midelt", "country": "Morocco", "region": "Africa"},
-    {"name": "Guelmim", "country": "Morocco", "region": "Africa"},
-    {"name": "Dakhla", "country": "Morocco", "region": "Africa"},
-    {"name": "Laayoune", "country": "Morocco", "region": "Africa"},
-    {"name": "Asilah", "country": "Morocco", "region": "Africa"},
-    {"name": "Sidi Ifni", "country": "Morocco", "region": "Africa"},
-    {"name": "Tiznit", "country": "Morocco", "region": "Africa"},
-    {"name": "Khenifra", "country": "Morocco", "region": "Africa"},
-    {"name": "Berkane", "country": "Morocco", "region": "Africa"},
-    {"name": "Taourirt", "country": "Morocco", "region": "Africa"},
-    {"name": "Figuig", "country": "Morocco", "region": "Africa"},
-    {"name": "Sidi Kacem", "country": "Morocco", "region": "Africa"},
-    {"name": "Skhirat", "country": "Morocco", "region": "Africa"},
-    {"name": "Temara", "country": "Morocco", "region": "Africa"},
-    {"name": "Mohammedia", "country": "Morocco", "region": "Africa"},
-    {"name": "Ben Guerir", "country": "Morocco", "region": "Africa"},
-    {"name": "Tifelt", "country": "Morocco", "region": "Africa"},
-    {"name": "Bouznika", "country": "Morocco", "region": "Africa"},
-    {"name": "M'diq", "country": "Morocco", "region": "Africa"},
-    {"name": "Fnideq", "country": "Morocco", "region": "Africa"},
-    {"name": "Martil", "country": "Morocco", "region": "Africa"},
-    {"name": "Berrechid", "country": "Morocco", "region": "Africa"},
-    {"name": "Sidi Bennour", "country": "Morocco", "region": "Africa"},
-    {"name": "Youssoufia", "country": "Morocco", "region": "Africa"},
-    {"name": "Jerada", "country": "Morocco", "region": "Africa"},
-    {"name": "Oulad Teima", "country": "Morocco", "region": "Africa"},
-    {"name": "Benslimane", "country": "Morocco", "region": "Africa"},
-    {"name": "Ait Melloul", "country": "Morocco", "region": "Africa"},
-    {"name": "Sidi Slimane", "country": "Morocco", "region": "Africa"},
-    {"name": "Tan-Tan", "country": "Morocco", "region": "Africa"},
-    {"name": "Ouezzane", "country": "Morocco", "region": "Africa"},
-    {"name": "Sefrou", "country": "Morocco", "region": "Africa"},
-    {"name": "Boulemane", "country": "Morocco", "region": "Africa"},
-    {"name": "Taounate", "country": "Morocco", "region": "Africa"},
-    {"name": "Goulmima", "country": "Morocco", "region": "Africa"},
-    {"name": "Midar", "country": "Morocco", "region": "Africa"},
-    {"name": "Zagora", "country": "Morocco", "region": "Africa"},
-    {"name": "Sidi Yahya Zaer", "country": "Morocco", "region": "Africa"},
-]
+# ==================== COORDINATES PROVIDER ====================
+class CoordinatesProvider:
+    def __init__(self):
+        self.geolocator = Nominatim(
+            user_agent="CityExplorer/2.0 (https://traveltto.com)",
+            timeout=config.GEOLOCATOR_TIMEOUT
+        )
+    
+    def get_coordinates(self, city_name: str, country: str = None) -> Optional[Dict]:
+        cache_key = f"coords:{city_name}:{country}"
+        
+        cached = cache.get(cache_key)
+        if cached:
+            return cached
+        
+        queries = []
+        
+        if country:
+            queries.append(f"{city_name}, {country}")
+        
+        queries.append(f"{city_name}")
+        
+        for query in queries:
+            try:
+                location = self.geolocator.geocode(
+                    query,
+                    exactly_one=True,
+                    addressdetails=True,
+                    language="en",
+                    timeout=config.GEOLOCATOR_TIMEOUT
+                )
+                
+                if location and hasattr(location, 'latitude'):
+                    coords = {
+                        "lat": location.latitude,
+                        "lon": location.longitude
+                    }
+                    cache.set(cache_key, coords, config.CACHE_TTL_COORDS)
+                    return coords
+                    
+            except Exception as e:
+                logger.debug(f"Geolocation failed for '{query}': {e}")
+                continue
+        
+        return None
 
+coordinates_provider = CoordinatesProvider()
+
+# ==================== YOUR CITY DATA ====================
 WORLD_CITIES = [
     # EUROPE (Expanded - 200+ cities)
     {"name":"Paris","country":"France","region":"Europe"},
@@ -1564,48 +1680,50 @@ WORLD_CITIES = [
     {"name":"South Tarawa","country":"Kiribati","region":"Oceania"},
 ]
 
+# Separate Moroccan cities for the /api/morocco endpoint
+MOROCCO_CITIES = [city for city in WORLD_CITIES if city["country"] == "Morocco"]
+
+# Region list
+REGIONS = set(["Europe", "North America", "Asia", "Oceania", "Middle East", "South America", "Africa"])
+
 # ==================== FLASK APP ====================
 app = Flask(__name__)
 
-# CORS configuration
+# Configure CORS for specific origins only
 CORS(app, 
-     origins=config.ALLOWED_ORIGINS,
+     origins=ALLOWED_ORIGINS,
      methods=["GET", "OPTIONS"],
-     allow_headers=["Content-Type", "Authorization", "If-None-Match"],
-     supports_credentials=True,
+     allow_headers=["Content-Type", "Authorization"],
+     supports_credentials=False,
      max_age=3600)
 
-# Helper function for cache headers
-def add_cache_headers(response, ttl=None):
-    """Add cache control headers to response"""
-    if config.ENABLE_CLIENT_CACHE:
-        ttl = ttl or config.CLIENT_CACHE_TTL
-        response.headers['Cache-Control'] = f'public, max-age={ttl}'
-        response.headers['Expires'] = (datetime.utcnow() + timedelta(seconds=ttl)).strftime('%a, %d %b %Y %H:%M:%S GMT')
-    return response
-
 # ==================== ROUTES ====================
+@app.before_request
+def before_request():
+    """Check origin before processing any request"""
+    if request.method == 'OPTIONS':
+        return
+    response = check_origin()
+    if response:
+        return response
 
 @app.route('/')
 def home():
     return jsonify({
         "name": "City Explorer API",
         "version": "2.0",
-        "status": "online",
-        "description": "API for exploring Moroccan cities with detailed information",
+        "status": "operational",
+        "total_cities": len(WORLD_CITIES),
+        "total_morocco_cities": len(MOROCCO_CITIES),
         "endpoints": {
-            "health": "/api/health",
-            "cities": "/api/cities",
+            "cities_list": "/api/cities (50 per page)",
             "city_details": "/api/cities/<city_name>",
-            "morocco": "/api/morocco",
+            "morocco_cities": "/api/morocco",
             "morocco_city": "/api/morocco/<city_name>",
-            "search": "/api/search",
-            "regions": "/api/regions"
+            "search": "/api/search?q=<query>",
+            "health": "/api/health"
         },
-        "statistics": {
-            "total_cities": len(WORLD_CITIES),
-            "moroccan_cities": len(MOROCCAN_CITIES)
-        }
+        "note": "All data is fetched dynamically from Wikimedia/Wikipedia APIs"
     })
 
 @app.route('/api/health')
@@ -1613,113 +1731,101 @@ def health():
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
-        "statistics": {
-            "total_cities": len(WORLD_CITIES),
-            "moroccan_cities": len(MOROCCAN_CITIES)
-        },
-        "cache_enabled": True,
-        "performance_mode": "optimized"
-    })
-
-@app.route('/api/regions')
-def get_regions():
-    """Get all available regions from city data"""
-    regions = sorted(set(city.get('region') for city in WORLD_CITIES if city.get('region')))
-    
-    # Count cities per region
-    region_counts = {}
-    for city in WORLD_CITIES:
-        region = city.get('region')
-        if region:
-            region_counts[region] = region_counts.get(region, 0) + 1
-    
-    return jsonify({
-        "success": True,
-        "regions": regions,
-        "counts": region_counts,
-        "total_regions": len(regions)
+        "total_cities": len(WORLD_CITIES),
+        "total_morocco_cities": len(MOROCCO_CITIES),
+        "mode": "dynamic-fetching"
     })
 
 @app.route('/api/cities')
 def get_cities():
     """
-    Get paginated list of cities with minimal data
-    Returns 50 cities per page by default
+    Get paginated list of cities with minimal data (50 per page)
+    Returns: name, region, small description, and one image
     """
-    # Parse query parameters
-    page = max(1, int(request.args.get('page', 1)))
-    limit = min(50, max(1, int(request.args.get('limit', config.CITIES_PER_PAGE))))
-    region = request.args.get('region')
-    country = request.args.get('country')
+    # Check origin
+    origin_check = check_origin()
+    if origin_check:
+        return origin_check
     
-    # Cache key for this specific request
-    cache_key = f"cities:{page}:{limit}:{region}:{country}"
-    cached = cache.get(cache_key)
-    
-    if cached:
-        response = jsonify(cached)
-        return add_cache_headers(response, 300)
+    page = request.args.get('page', 1, type=int)
+    limit = request.args.get('limit', 50, type=int)  # Fixed to 50 per page
+    region = request.args.get('region', type=str)
+    country = request.args.get('country', type=str)
     
     # Filter cities
-    filtered = WORLD_CITIES
+    filtered_cities = WORLD_CITIES
     if region:
-        filtered = [c for c in filtered if c.get('region') == region]
+        filtered_cities = [c for c in filtered_cities if c.get('region') == region]
     if country:
-        filtered = [c for c in filtered if c.get('country') == country]
+        filtered_cities = [c for c in filtered_cities if c.get('country') == country]
     
-    # Pagination
-    total = len(filtered)
-    start = (page - 1) * limit
-    end = start + limit
-    page_cities = filtered[start:end]
+    total_cities = len(filtered_cities)
+    start_idx = (page - 1) * limit
+    end_idx = min(start_idx + limit, total_cities)
     
-    # Fetch previews
     cities_list = []
-    for city_info in page_cities:
-        preview = city_provider.get_city_preview(
-            city_info['name'],
-            city_info.get('country'),
-            city_info.get('region')
-        )
-        cities_list.append(preview)
     
-    # Build response
-    response_data = {
+    for i in range(start_idx, end_idx):
+        city_info = filtered_cities[i]
+        city_name = city_info['name']
+        
+        try:
+            # Get minimal data for list view
+            summary, _ = wikipedia_provider.get_city_summary(city_name)
+            image = image_fetcher.get_one_representative_image(city_name)
+            coordinates = coordinates_provider.get_coordinates(city_name, city_info.get('country'))
+            
+            cities_list.append({
+                "id": city_name.lower().replace(' ', '-'),
+                "name": city_name,
+                "country": city_info.get('country'),
+                "region": city_info.get('region'),
+                "summary": summary or f"{city_name}, {city_info.get('country', 'a city')}",
+                "image": image,
+                "coordinates": coordinates,
+                "has_details": True
+            })
+            
+        except Exception as e:
+            logger.warning(f"Failed to load minimal data for {city_name}: {e}")
+            cities_list.append({
+                "id": city_name.lower().replace(' ', '-'),
+                "name": city_name,
+                "country": city_info.get('country'),
+                "region": city_info.get('region'),
+                "summary": f"{city_name}, {city_info.get('country', 'a city')}",
+                "image": None,
+                "coordinates": None,
+                "has_details": False
+            })
+    
+    return jsonify({
         "success": True,
         "data": cities_list,
         "pagination": {
             "page": page,
             "limit": limit,
-            "total": total,
-            "pages": max(1, (total + limit - 1) // limit),
-            "next_page": page + 1 if end < total else None,
+            "total": total_cities,
+            "pages": max(1, (total_cities + limit - 1) // limit),
+            "next_page": page + 1 if end_idx < total_cities else None,
             "prev_page": page - 1 if page > 1 else None
-        },
-        "cache_info": {
-            "client_cache_ttl": 300,
-            "images_are_optimized": True,
-            "descriptions_available": True
         }
-    }
-    
-    # Cache the response
-    cache.set(cache_key, response_data, 300)
-    
-    response = jsonify(response_data)
-    return add_cache_headers(response, 300)
+    })
 
 @app.route('/api/cities/<path:city_name>')
 def get_city_details(city_name):
-    """Get full details for a specific city"""
+    """
+    Get full details for a specific city
+    Fetches: All images, landmarks with their own images, coordinates, etc.
+    """
+    # Check origin
+    origin_check = check_origin()
+    if origin_check:
+        return origin_check
+    
     city_name = unquote(city_name)
     
-    # Check ETag for client cache
-    etag = hashlib.md5(f"city:{city_name}".encode()).hexdigest()
-    if_none_match = request.headers.get('If-None-Match')
-    if if_none_match == etag:
-        return Response(status=304)
-    
-    # Find city
+    # Find city in WORLD_CITIES
     city_info = None
     for city in WORLD_CITIES:
         if city['name'].lower() == city_name.lower():
@@ -1729,124 +1835,128 @@ def get_city_details(city_name):
     if not city_info:
         return jsonify({
             "success": False,
-            "error": "City not found"
+            "error": f"City '{city_name}' not found in database"
         }), 404
     
     try:
-        details = city_provider.get_city_details(
-            city_info['name'],
-            city_info.get('country'),
-            city_info.get('region')
-        )
+        # Get detailed info
+        summary, wiki_title = wikipedia_provider.get_city_summary(city_name)
         
-        # Add ETag for caching
-        details['_cache'] = {
-            "etag": etag,
-            "last_updated": time.time()
-        }
+        # Get coordinates
+        coordinates = coordinates_provider.get_coordinates(city_name, city_info.get('country'))
         
-        response = jsonify({
-            "success": True,
-            "data": details
-        })
+        # Get multiple images for the city
+        city_images = image_fetcher.get_images_for_city(city_name, limit=20)
         
-        # Add cache headers
-        response.headers['ETag'] = etag
-        response.headers['Cache-Control'] = f'public, max-age={config.CLIENT_CACHE_TTL}'
-        
-        return response
-        
-    except Exception as e:
-        logger.error(f"Error fetching city details for {city_name}: {e}")
-        return jsonify({
-            "success": False,
-            "error": "Failed to fetch city details"
-        }), 500
-
-@app.route('/api/cities/<path:city_name>/landmarks/<path:landmark_name>/images')
-def get_landmark_images(city_name, landmark_name):
-    """Get images for a specific landmark"""
-    city_name = unquote(city_name)
-    landmark_name = unquote(landmark_name)
-    
-    try:
-        images = image_fetcher.get_landmark_images(landmark_name, city_name)
+        # Get landmarks with their own images
+        landmarks = wikipedia_provider.extract_landmarks(city_name)
         
         return jsonify({
             "success": True,
             "data": {
-                "city": city_name,
-                "landmark": landmark_name,
-                "images": images
+                "name": city_name,
+                "country": city_info.get('country'),
+                "region": city_info.get('region'),
+                "wiki_title": wiki_title,
+                "summary": summary or f"Information about {city_name}",
+                "coordinates": coordinates,
+                "images": city_images,
+                "image_count": len(city_images),
+                "landmarks": landmarks,
+                "landmark_count": len(landmarks),
+                "fetched_at": datetime.utcnow().isoformat()
             }
         })
         
     except Exception as e:
-        logger.error(f"Error fetching landmark images: {e}")
+        logger.error(f"Failed to fetch city details for {city_name}: {e}")
         return jsonify({
             "success": False,
-            "error": "Failed to fetch landmark images"
+            "error": f"Failed to fetch details for {city_name}"
         }), 500
 
 @app.route('/api/morocco')
-def get_moroccan_cities():
-    """Get only Moroccan cities"""
-    # Same logic as /api/cities but filtered
-    page = max(1, int(request.args.get('page', 1)))
-    limit = min(50, max(1, int(request.args.get('limit', config.CITIES_PER_PAGE))))
+def get_morocco_cities():
+    """
+    Get paginated list of Moroccan cities only (50 per page)
+    """
+    # Check origin
+    origin_check = check_origin()
+    if origin_check:
+        return origin_check
     
-    cache_key = f"morocco:{page}:{limit}"
-    cached = cache.get(cache_key)
+    page = request.args.get('page', 1, type=int)
+    limit = request.args.get('limit', 50, type=int)
     
-    if cached:
-        response = jsonify(cached)
-        return add_cache_headers(response, 300)
-    
-    total = len(MOROCCAN_CITIES)
-    start = (page - 1) * limit
-    end = start + limit
-    page_cities = MOROCCAN_CITIES[start:end]
+    total_cities = len(MOROCCO_CITIES)
+    start_idx = (page - 1) * limit
+    end_idx = min(start_idx + limit, total_cities)
     
     cities_list = []
-    for city_info in page_cities:
-        preview = city_provider.get_city_preview(
-            city_info['name'],
-            city_info.get('country'),
-            city_info.get('region')
-        )
-        cities_list.append(preview)
     
-    response_data = {
+    for i in range(start_idx, end_idx):
+        city_info = MOROCCO_CITIES[i]
+        city_name = city_info['name']
+        
+        try:
+            # Get minimal data for list view
+            summary, _ = wikipedia_provider.get_city_summary(city_name)
+            image = image_fetcher.get_one_representative_image(city_name)
+            coordinates = coordinates_provider.get_coordinates(city_name, "Morocco")
+            
+            cities_list.append({
+                "id": city_name.lower().replace(' ', '-'),
+                "name": city_name,
+                "country": "Morocco",
+                "region": city_info.get('region'),
+                "summary": summary or f"{city_name}, Morocco",
+                "image": image,
+                "coordinates": coordinates,
+                "has_details": True
+            })
+            
+        except Exception as e:
+            logger.warning(f"Failed to load Moroccan city {city_name}: {e}")
+            cities_list.append({
+                "id": city_name.lower().replace(' ', '-'),
+                "name": city_name,
+                "country": "Morocco",
+                "region": city_info.get('region'),
+                "summary": f"{city_name}, Morocco",
+                "image": None,
+                "coordinates": None,
+                "has_details": False
+            })
+    
+    return jsonify({
         "success": True,
+        "country": "Morocco",
         "data": cities_list,
         "pagination": {
             "page": page,
             "limit": limit,
-            "total": total,
-            "pages": max(1, (total + limit - 1) // limit),
-            "next_page": page + 1 if end < total else None,
+            "total": total_cities,
+            "pages": max(1, (total_cities + limit - 1) // limit),
+            "next_page": page + 1 if end_idx < total_cities else None,
             "prev_page": page - 1 if page > 1 else None
-        },
-        "country_info": {
-            "name": "Morocco",
-            "total_cities": total,
-            "description": "Kingdom of Morocco - A North African country with diverse landscapes and rich history."
         }
-    }
-    
-    cache.set(cache_key, response_data, 300)
-    
-    response = jsonify(response_data)
-    return add_cache_headers(response, 300)
+    })
 
 @app.route('/api/morocco/<path:city_name>')
-def get_moroccan_city_details(city_name):
-    """Get details for a Moroccan city"""
+def get_morocco_city_details(city_name):
+    """
+    Get full details for a specific Moroccan city
+    """
+    # Check origin
+    origin_check = check_origin()
+    if origin_check:
+        return origin_check
+    
     city_name = unquote(city_name)
     
-    # Find Moroccan city
+    # Find city in MOROCCO_CITIES
     city_info = None
-    for city in MOROCCAN_CITIES:
+    for city in MOROCCO_CITIES:
         if city['name'].lower() == city_name.lower():
             city_info = city
             break
@@ -1854,91 +1964,108 @@ def get_moroccan_city_details(city_name):
     if not city_info:
         return jsonify({
             "success": False,
-            "error": "Moroccan city not found"
+            "error": f"Moroccan city '{city_name}' not found in database"
         }), 404
     
     try:
-        details = city_provider.get_city_details(
-            city_info['name'],
-            city_info.get('country'),
-            city_info.get('region')
-        )
+        # Get detailed info
+        search_name = f"{city_name}, Morocco"
+        summary, wiki_title = wikipedia_provider.get_city_summary(search_name)
+        if not summary:
+            summary, wiki_title = wikipedia_provider.get_city_summary(city_name)
         
-        etag = hashlib.md5(f"morocco:{city_name}".encode()).hexdigest()
-        details['_cache'] = {"etag": etag}
+        # Get coordinates
+        coordinates = coordinates_provider.get_coordinates(city_name, "Morocco")
         
-        response = jsonify({
+        # Get multiple images for the city
+        city_images = image_fetcher.get_images_for_city(search_name, limit=20)
+        if not city_images:
+            city_images = image_fetcher.get_images_for_city(city_name, limit=20)
+        
+        # Get landmarks with their own images
+        landmarks = wikipedia_provider.extract_landmarks(search_name)
+        if not landmarks:
+            landmarks = wikipedia_provider.extract_landmarks(city_name)
+        
+        return jsonify({
             "success": True,
-            "data": details
+            "data": {
+                "name": city_name,
+                "country": "Morocco",
+                "region": city_info.get('region'),
+                "wiki_title": wiki_title,
+                "summary": summary or f"Information about {city_name}, Morocco",
+                "coordinates": coordinates,
+                "images": city_images,
+                "image_count": len(city_images),
+                "landmarks": landmarks,
+                "landmark_count": len(landmarks),
+                "fetched_at": datetime.utcnow().isoformat()
+            }
         })
         
-        response.headers['ETag'] = etag
-        response.headers['Cache-Control'] = f'public, max-age={config.CLIENT_CACHE_TTL}'
-        
-        return response
-        
     except Exception as e:
-        logger.error(f"Error fetching Moroccan city details: {e}")
+        logger.error(f"Failed to fetch Moroccan city details for {city_name}: {e}")
         return jsonify({
             "success": False,
-            "error": "Failed to fetch city details"
+            "error": f"Failed to fetch details for {city_name}, Morocco"
         }), 500
 
 @app.route('/api/search')
 def search_cities():
-    """Search for cities"""
+    """
+    Search for cities
+    """
+    # Check origin
+    origin_check = check_origin()
+    if origin_check:
+        return origin_check
+    
     query = request.args.get('q', '').strip()
+    limit = request.args.get('limit', 20, type=int)
     
     if len(query) < 2:
         return jsonify({
             "success": False,
-            "error": "Query must be at least 2 characters"
+            "error": "Search query must be at least 2 characters"
         }), 400
     
-    limit = min(20, max(1, int(request.args.get('limit', 10))))
-    
-    # Search in city names
     results = []
+    
     for city in WORLD_CITIES:
         if query.lower() in city['name'].lower():
-            preview = city_provider.get_city_preview(
-                city['name'],
-                city.get('country'),
-                city.get('region')
-            )
-            results.append(preview)
+            city_name = city['name']
             
-            if len(results) >= limit:
-                break
+            try:
+                # Get minimal data for search results
+                summary, _ = wikipedia_provider.get_city_summary(city_name)
+                image = image_fetcher.get_one_representative_image(city_name)
+                coordinates = coordinates_provider.get_coordinates(city_name, city.get('country'))
+                
+                results.append({
+                    "id": city_name.lower().replace(' ', '-'),
+                    "name": city_name,
+                    "country": city.get('country'),
+                    "region": city.get('region'),
+                    "summary": summary or f"{city_name}, {city.get('country', 'a city')}",
+                    "image": image,
+                    "coordinates": coordinates,
+                    "has_details": True
+                })
+                
+                if len(results) >= limit:
+                    break
+                    
+            except Exception:
+                pass
     
     return jsonify({
         "success": True,
         "query": query,
-        "results": results,
-        "count": len(results)
+        "count": len(results),
+        "data": results
     })
 
-# ==================== MIDDLEWARE ====================
-@app.before_request
-def before_request():
-    """Log requests and check origin"""
-    origin = request.headers.get('Origin')
-    if origin and origin not in config.ALLOWED_ORIGINS and not request.path.startswith('/api/health'):
-        logger.warning(f"Blocked request from unauthorized origin: {origin}")
-        return jsonify({
-            "success": False,
-            "error": "Unauthorized origin"
-        }), 403
-
-@app.after_request
-def after_request(response):
-    """Add security headers"""
-    response.headers['X-Content-Type-Options'] = 'nosniff'
-    response.headers['X-Frame-Options'] = 'DENY'
-    response.headers['X-XSS-Protection'] = '1; mode=block'
-    return response
-
-# ==================== ERROR HANDLERS ====================
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({
@@ -1947,26 +2074,30 @@ def not_found(error):
     }), 404
 
 @app.errorhandler(500)
-def server_error(error):
-    logger.error(f"Server error: {error}")
+def internal_error(error):
+    logger.error(f"Internal server error: {error}")
     return jsonify({
         "success": False,
         "error": "Internal server error"
     }), 500
 
-# ==================== VERCEL ENTRY POINT ====================
-def handler(event, context):
-    """Vercel serverless handler"""
-    return app(event, context)
-
 # ==================== MAIN ====================
 if __name__ == '__main__':
-    logger.info("Starting City Explorer API")
-    logger.info(f"Total cities: {len(WORLD_CITIES)}")
-    logger.info(f"Moroccan cities: {len(MOROCCAN_CITIES)}")
+    logger.info("🚀 Starting City Explorer API")
+    logger.info(f"✅ Allowed origins: {ALLOWED_ORIGINS}")
+    logger.info(f"📊 Total cities: {len(WORLD_CITIES)}")
+    logger.info(f"📊 Moroccan cities: {len(MOROCCO_CITIES)}")
+    
+    port = int(os.environ.get('PORT', 5000))
     
     app.run(
         host='0.0.0.0',
-        port=int(os.environ.get('PORT', 5000)),
-        debug=False  # Set to False for production
+        port=port,
+        debug=config.FLASK_DEBUG,
+        threaded=True
     )
+else:
+    logger.info("🔧 Running in serverless mode")
+    logger.info(f"✅ Allowed origins: {ALLOWED_ORIGINS}")
+    logger.info(f"📊 Total cities: {len(WORLD_CITIES)}")
+    logger.info(f"📊 Moroccan cities: {len(MOROCCO_CITIES)}")
