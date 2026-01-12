@@ -3,67 +3,142 @@ import re
 import json
 import time
 import logging
+import threading
 import hashlib
-from typing import List, Dict, Optional, Tuple, Any
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from typing import List, Dict, Optional, Tuple, Any, Set
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import wraps, lru_cache
+from datetime import datetime, timedelta
 from collections import defaultdict
-from urllib.parse import quote_plus, unquote
+from urllib.parse import quote_plus, unquote, urlparse
 import requests
 import wikipediaapi
 import diskcache
 from geopy.geocoders import Nominatim
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response, send_from_directory
 from flask_cors import CORS
 from dataclasses import dataclass, field
 import redis
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from ratelimit import limits, RateLimitException
+import backoff
 
-# ==================== SIMPLIFIED CONFIGURATION ====================
+# ==================== CONFIGURATION ====================
 @dataclass
 class Config:
-    # Cache settings - longer TTL for better performance
-    CACHE_TTL: int = int(os.getenv("CACHE_TTL", "86400"))  # 24 hours
-    CACHE_TTL_IMAGES: int = int(os.getenv("CACHE_TTL_IMAGES", "172800"))  # 48 hours
-    CACHE_TTL_PREVIEW: int = int(os.getenv("CACHE_TTL_PREVIEW", "86400"))  # 24 hours
+    # Your two allowed domains
+    ALLOWED_ORIGINS: List[str] = field(default_factory=lambda: [
+        "https://www.traveltto.com",
+        "https://traveltto.vercel.app"
+    ])
     
-    # Performance settings
-    MAX_WORKERS: int = int(os.getenv("MAX_WORKERS", "5"))
-    REQUEST_TIMEOUT: int = int(os.getenv("REQUEST_TIMEOUT", "10"))
-    WIKIPEDIA_TIMEOUT: int = int(os.getenv("WIKIPEDIA_TIMEOUT", "15"))
-    GEOLOCATOR_TIMEOUT: int = int(os.getenv("GEOLOCATOR_TIMEOUT", "5"))
+    UNSPLASH_ACCESS_KEY: str = os.getenv("UNSPLASH_ACCESS_KEY", "")
+    MAPBOX_ACCESS_TOKEN: str = os.getenv("MAPBOX_ACCESS_TOKEN", "")
+    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
     
-    # App settings
+    CACHE_TTL: int = int(os.getenv("CACHE_TTL", "7200"))
+    CACHE_TTL_IMAGES: int = int(os.getenv("CACHE_TTL_IMAGES", "86400"))
+    CACHE_TTL_COORDS: int = int(os.getenv("CACHE_TTL_COORDS", "259200"))
+    CACHE_TTL_PREVIEW: int = int(os.getenv("CACHE_TTL_PREVIEW", "3600"))
+    
+    MAX_IMAGE_WORKERS: int = int(os.getenv("MAX_IMAGE_WORKERS", "6"))
+    MAX_DETAIL_WORKERS: int = int(os.getenv("MAX_DETAIL_WORKERS", "4"))
+    MAX_PRELOAD_WORKERS: int = int(os.getenv("MAX_PRELOAD_WORKERS", "3"))
+    
+    REQUEST_TIMEOUT: int = int(os.getenv("REQUEST_TIMEOUT", "15"))
+    WIKIPEDIA_TIMEOUT: int = int(os.getenv("WIKIPEDIA_TIMEOUT", "20"))
+    GEOLOCATOR_TIMEOUT: int = int(os.getenv("GEOLOCATOR_TIMEOUT", "10"))
+    
     FLASK_DEBUG: bool = os.getenv("FLASK_DEBUG", "false").lower() == "true"
     FLASK_PORT: int = int(os.getenv("PORT", os.getenv("FLASK_PORT", "5000")))
     
-    # Cache directories
+    MAP_TILE_PROVIDER: str = os.getenv("MAP_TILE_PROVIDER", "openstreetmap")
+    
     CACHE_DIR: str = os.getenv("CACHE_DIR", "/tmp/city_explorer_cache")
+    LOCAL_CACHE_FILE: str = os.getenv("LOCAL_CACHE_FILE", "/tmp/cities_data.json")
     IMAGE_CACHE_DIR: str = os.getenv("IMAGE_CACHE_DIR", "/tmp/image_cache")
     
-    # Image settings
+    PRELOAD_TOP_CITIES: int = int(os.getenv("PRELOAD_TOP_CITIES", "8"))
+    BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "20"))
+    LAZY_LOADING: bool = os.getenv("LAZY_LOADING", "true").lower() == "true"
+    
+    MAX_WIKIMEDIA_FILES_TO_SCAN: int = 80
     MAX_IMAGES_PER_REQUEST: int = 8
     MAX_IMAGES_PREVIEW: int = 1
+    WIKIMEDIA_RETRY_ATTEMPTS: int = 3
     MIN_IMAGE_WIDTH: int = 400
     MIN_IMAGE_HEIGHT: int = 300
+    PREFERRED_IMAGE_FORMATS: List[str] = field(default_factory=lambda: ['.jpg', '.jpeg', '.png', '.webp'])
     
-    # Feature flags
-    ENABLE_FALLBACK_IMAGES: bool = True
-    ENABLE_COORDINATE_FALLBACK: bool = True
+    MIN_IMAGE_QUALITY_SCORE: int = 40
+    REQUIRED_SUCCESS_RATE: float = 0.6
     
+    ENABLE_METRICS: bool = os.getenv("ENABLE_METRICS", "true").lower() == "true"
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
+    
+    ENABLE_FALLBACK_IMAGES: bool = os.getenv("ENABLE_FALLBACK_IMAGES", "true").lower() == "true"
+    ENABLE_COORDINATE_FALLBACK: bool = os.getenv("ENABLE_COORDINATE_FALLBACK", "true").lower() == "true"
+    
+    REQUESTS_PER_MINUTE: int = int(os.getenv("REQUESTS_PER_MINUTE", "30"))
+    WIKIMEDIA_RATE_LIMIT: int = int(os.getenv("WIKIMEDIA_RATE_LIMIT", "50"))
+    
+    MAX_TEXT_LENGTH: int = 1000000
+    MAX_SUMMARY_LENGTH: int = 1000000
+    MAX_SECTION_LENGTH: int = 1000000
+    MAX_DETAILED_SUMMARY_LENGTH: int = 1000000
+    
+    # Pagination settings
+    CITIES_PER_PAGE: int = 50  # Changed from 100 to 50
 
 config = Config()
 
-# ==================== LOGGING ====================
-logging.basicConfig(level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO))
+# ==================== ENHANCED LOGGING ====================
+class ColorFormatter(logging.Formatter):
+    grey = "\x1b[38;21m"
+    yellow = "\x1b[33;21m"
+    red = "\x1b[31;21m"
+    bold_red = "\x1b[31;1m"
+    reset = "\x1b[0m"
+    
+    FORMATS = {
+        logging.DEBUG: grey + "%(asctime)s - %(name)s - %(levelname)s - %(message)s" + reset,
+        logging.INFO: grey + "%(asctime)s - %(levelname)s - %(message)s" + reset,
+        logging.WARNING: yellow + "%(asctime)s - %(name)s - %(levelname)s - %(message)s" + reset,
+        logging.ERROR: red + "%(asctime)s - %(name)s - %(levelname)s - %(message)s" + reset,
+        logging.CRITICAL: bold_red + "%(asctime)s - %(name)s - %(levelname)s - %(message)s" + reset
+    }
+    
+    def format(self, record):
+        log_fmt = self.FORMATS.get(record.levelno)
+        formatter = logging.Formatter(log_fmt)
+        return formatter.format(record)
+
 logger = logging.getLogger("CityExplorer")
+logger.setLevel(getattr(logging, config.LOG_LEVEL.upper(), logging.INFO))
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(ColorFormatter())
+logger.addHandler(console_handler)
+
+try:
+    file_handler = logging.FileHandler('/tmp/city_explorer.log')
+    file_handler.setFormatter(logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    ))
+    logger.addHandler(file_handler)
+except Exception as e:
+    logger.warning(f"Could not set up file logging: {e}")
+
+logger.info("🚀 City Explorer API Initializing...")
 
 # ==================== ENHANCED CACHING SYSTEM ====================
-class EnhancedCache:
+class MultiLevelCache:
     def __init__(self):
         self.memory_cache = {}
         self.disk_cache = None
+        self.redis_client = None
+        self.hits = 0
+        self.misses = 0
         
         try:
             os.makedirs(config.CACHE_DIR, exist_ok=True)
@@ -74,8 +149,6 @@ class EnhancedCache:
             logger.warning(f"⚠️ Failed to initialize disk cache: {e}")
             self.disk_cache = diskcache.Cache()
         
-        # Try Redis if available
-        self.redis_client = None
         if os.getenv("REDIS_URL"):
             try:
                 self.redis_client = redis.from_url(os.getenv("REDIS_URL"))
@@ -85,19 +158,18 @@ class EnhancedCache:
                 logger.warning(f"⚠️ Redis cache unavailable: {e}")
     
     def get(self, key: str, default=None):
-        # Check memory cache first (fastest)
         if key in self.memory_cache:
             item = self.memory_cache.get(key)
             if item and time.time() - item.get('timestamp', 0) < config.CACHE_TTL:
+                self.hits += 1
                 return item.get('value')
         
-        # Check Redis if available
         if self.redis_client:
             try:
                 cached = self.redis_client.get(f"city:{key}")
                 if cached:
+                    self.hits += 1
                     data = json.loads(cached)
-                    # Also store in memory cache for faster access
                     self.memory_cache[key] = {
                         'value': data,
                         'timestamp': time.time()
@@ -106,17 +178,17 @@ class EnhancedCache:
             except Exception:
                 pass
         
-        # Check disk cache
         if self.disk_cache:
             try:
                 cached = self.disk_cache.get(key)
                 if cached and time.time() - cached.get('timestamp', 0) < config.CACHE_TTL:
-                    # Store in memory cache for faster access
+                    self.hits += 1
                     self.memory_cache[key] = cached
                     return cached.get('value')
             except Exception:
                 pass
         
+        self.misses += 1
         return default
     
     def set(self, key: str, value: Any, ttl: int = None):
@@ -125,10 +197,8 @@ class EnhancedCache:
             'timestamp': time.time()
         }
         
-        # Store in memory cache
         self.memory_cache[key] = cache_item
         
-        # Store in Redis if available
         if self.redis_client:
             try:
                 ttl_actual = ttl or config.CACHE_TTL
@@ -140,17 +210,43 @@ class EnhancedCache:
             except Exception:
                 pass
         
-        # Store in disk cache
         if self.disk_cache:
             try:
                 self.disk_cache.set(key, cache_item, expire=ttl or config.CACHE_TTL)
             except Exception:
                 pass
+    
+    def delete(self, key: str):
+        if key in self.memory_cache:
+            del self.memory_cache[key]
+        
+        if self.redis_client:
+            try:
+                self.redis_client.delete(f"city:{key}")
+            except Exception:
+                pass
+        
+        if self.disk_cache:
+            try:
+                del self.disk_cache[key]
+            except Exception:
+                pass
+    
+    def get_stats(self):
+        total = self.hits + self.misses
+        hit_rate = (self.hits / total * 100) if total > 0 else 0
+        return {
+            'hits': self.hits,
+            'misses': self.misses,
+            'hit_rate': f"{hit_rate:.1f}%",
+            'memory_items': len(self.memory_cache),
+            'disk_size': len(self.disk_cache) if self.disk_cache else 0
+        }
 
-cache = EnhancedCache()
+cache = MultiLevelCache()
 
-# ==================== REQUEST HANDLER ====================
-class RequestHandler:
+# ==================== ENHANCED REQUEST HANDLER ====================
+class SmartRequestHandler:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
@@ -158,25 +254,50 @@ class RequestHandler:
             'Accept': 'application/json',
             'Accept-Language': 'en-US,en;q=0.9'
         })
+        self.request_times = []
+        self.failure_count = defaultdict(int)
     
     @retry(
-        stop=stop_after_attempt(2),
-        wait=wait_exponential(multiplier=1, min=2, max=5)
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((requests.exceptions.Timeout, 
+                                       requests.exceptions.ConnectionError))
     )
-    def get_json(self, url: str, params: dict = None) -> Any:
+    def get_with_retry(self, url: str, params: dict = None, headers: dict = None, 
+                       timeout: int = None) -> requests.Response:
+        start_time = time.time()
+        
         try:
             response = self.session.get(
                 url,
                 params=params,
-                timeout=config.REQUEST_TIMEOUT
+                headers=headers,
+                timeout=timeout or config.REQUEST_TIMEOUT
             )
+            
+            duration = time.time() - start_time
+            self.request_times.append(duration)
+            if len(self.request_times) > 100:
+                self.request_times.pop(0)
+            
+            if duration > 5:
+                logger.warning(f"Slow request: {url} took {duration:.2f}s")
+            
             response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            logger.debug(f"Request failed for {url}: {e}")
-            return None
+            return response
+            
+        except requests.exceptions.RequestException as e:
+            self.failure_count[url] += 1
+            logger.error(f"Request failed for {url}: {e}")
+            
+            if self.failure_count[url] > 5:
+                logger.warning(f"Circuit breaker triggered for {url}")
+                raise
+            
+            raise
     
-    def get_json_cached(self, url: str, params: dict = None, cache_key: str = None) -> Any:
+    def get_json_cached(self, url: str, params: dict = None, headers: dict = None, 
+                        cache_key: str = None, ttl: int = None) -> Any:
         if not cache_key:
             cache_key = hashlib.md5(
                 f"{url}{json.dumps(params or {}, sort_keys=True)}".encode()
@@ -184,21 +305,344 @@ class RequestHandler:
         
         cached = cache.get(cache_key)
         if cached is not None:
+            logger.debug(f"Cache hit for {url}")
             return cached
         
-        data = self.get_json(url, params)
-        if data:
-            cache.set(cache_key, data, config.CACHE_TTL)
+        try:
+            response = self.get_with_retry(url, params, headers)
+            data = response.json()
+            
+            cache.set(cache_key, data, ttl or config.CACHE_TTL)
+            
+            return data
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch {url}: {e}")
+            
+            if cached is not None:
+                logger.info(f"Using stale cache for {url}")
+                return cached
+            
+            raise
+    
+    def get_performance_stats(self):
+        if not self.request_times:
+            return {}
         
-        return data
+        return {
+            'total_requests': len(self.request_times),
+            'avg_time': sum(self.request_times) / len(self.request_times),
+            'max_time': max(self.request_times),
+            'min_time': min(self.request_times),
+            'failure_counts': dict(self.failure_count)
+        }
 
-request_handler = RequestHandler()
+request_handler = SmartRequestHandler()
 
-# ==================== IMAGE FETCHER (KEEPING YOUR LOGIC) ====================
+# ==================== LANDMARK IMAGE FETCHER ====================
+class LandmarkImageFetcher:
+    def __init__(self):
+        self.wikimedia_api = "https://commons.wikimedia.org/w/api.php"
+        self.wikipedia_api = "https://en.wikipedia.org/w/api.php"
+    
+    def fetch_landmark_images(self, landmark_name: str, city_name: str = None, limit: int = 3) -> List[Dict]:
+        """Fetch images for a specific landmark from Wikimedia"""
+        cache_key = f"landmark:{landmark_name}:{city_name}"
+        
+        cached = cache.get(cache_key)
+        if cached:
+            return cached
+        
+        images = []
+        
+        try:
+            # Try different search queries
+            search_queries = [
+                landmark_name,
+                f"{landmark_name} {city_name}" if city_name else landmark_name,
+                f"{landmark_name} architecture",
+                f"{landmark_name} building"
+            ]
+            
+            for query in search_queries:
+                if len(images) >= limit:
+                    break
+                    
+                params = {
+                    'action': 'query',
+                    'generator': 'search',
+                    'gsrsearch': query,
+                    'gsrnamespace': '6',  # File namespace
+                    'gsrlimit': 20,
+                    'prop': 'imageinfo',
+                    'iiprop': 'url|size|mime|extmetadata',
+                    'iiurlwidth': 800,
+                    'format': 'json'
+                }
+                
+                data = request_handler.get_json_cached(
+                    self.wikimedia_api,
+                    params=params,
+                    cache_key=f"wikimedia_landmark:{query}",
+                    ttl=config.CACHE_TTL_IMAGES
+                )
+                
+                for page in data.get('query', {}).get('pages', {}).values():
+                    if 'imageinfo' in page:
+                        info = page['imageinfo'][0]
+                        
+                        if self._is_relevant_image(info, landmark_name):
+                            image_data = {
+                                'url': info.get('thumburl') or info.get('url'),
+                                'title': page.get('title', '').replace('File:', ''),
+                                'description': self._extract_description(info),
+                                'source': 'wikimedia',
+                                'width': info.get('width'),
+                                'height': info.get('height'),
+                                'landmark_name': landmark_name,
+                                'page_url': f"https://commons.wikimedia.org/wiki/{page.get('title', '')}"
+                            }
+                            
+                            if image_data['url']:
+                                images.append(image_data)
+                                    
+                                if len(images) >= limit:
+                                    break
+        except Exception as e:
+            logger.warning(f"Landmark image fetch failed for {landmark_name}: {e}")
+        
+        # Cache even if empty
+        cache.set(cache_key, images, config.CACHE_TTL_IMAGES)
+        return images
+    
+    def _is_relevant_image(self, image_info: dict, query: str) -> bool:
+        mime = image_info.get('mime', '')
+        width = image_info.get('width', 0)
+        height = image_info.get('height', 0)
+        url = image_info.get('url', '').lower()
+        
+        if not mime.startswith('image/'):
+            return False
+        
+        if width < 300 or height < 200:
+            return False
+        
+        if not any(fmt in url for fmt in ['.jpg', '.jpeg', '.png', '.webp']):
+            return False
+        
+        return True
+    
+    def _extract_description(self, image_info: dict) -> str:
+        extmetadata = image_info.get('extmetadata', {})
+        
+        for field in ['ImageDescription', 'ObjectName', 'Caption']:
+            if field in extmetadata:
+                value = extmetadata[field].get('value', '')
+                if isinstance(value, str) and value.strip():
+                    clean_value = re.sub(r'<[^>]+>', '', value)
+                    return clean_value
+        
+        return ""
+
+# ==================== INTELLIGENT IMAGE FETCHER ====================
 class IntelligentImageFetcher:
     def __init__(self):
         self.wikimedia_api = "https://commons.wikimedia.org/w/api.php"
         self.wikipedia_api = "https://en.wikipedia.org/w/api.php"
+        self.landmark_fetcher = LandmarkImageFetcher()
+        
+    def calculate_image_quality(self, image_info: dict) -> int:
+        score = 50
+        
+        width = image_info.get('width', 0)
+        height = image_info.get('height', 0)
+        if width >= 1200 and height >= 800:
+            score += 30
+        elif width >= 800 and height >= 600:
+            score += 20
+        elif width >= 400 and height >= 300:
+            score += 10
+        
+        url = image_info.get('url', '').lower()
+        if any(fmt in url for fmt in ['.jpg', '.jpeg']):
+            score += 5
+        
+        if width > 0 and height > 0:
+            aspect_ratio = width / height
+            if aspect_ratio < 0.5 or aspect_ratio > 2.0:
+                score -= 10
+        
+        if image_info.get('source') == 'wikimedia':
+            score += 5
+        
+        return min(100, max(0, score))
+    
+    @retry(stop=stop_after_attempt(2), wait=wait_exponential(multiplier=1, min=2, max=5))
+    def fetch_from_wikimedia(self, query: str, limit: int = 8) -> List[Dict]:
+        images = []
+        
+        try:
+            search_queries = [
+                f'{query} city',
+                f'{query} landscape',
+                f'{query} aerial view',
+                f'{query} cityscape',
+                f'{query} tourism'
+            ]
+            
+            for search_query in search_queries:
+                if len(images) >= limit:
+                    break
+                    
+                params = {
+                    'action': 'query',
+                    'generator': 'search',
+                    'gsrsearch': search_query,
+                    'gsrnamespace': '6',
+                    'gsrlimit': 20,
+                    'prop': 'imageinfo',
+                    'iiprop': 'url|size|mime|extmetadata',
+                    'iiurlwidth': 800,
+                    'format': 'json'
+                }
+                
+                data = request_handler.get_json_cached(
+                    self.wikimedia_api,
+                    params=params,
+                    cache_key=f"wikimedia:{search_query}",
+                    ttl=config.CACHE_TTL_IMAGES
+                )
+                
+                for page in data.get('query', {}).get('pages', {}).values():
+                    if 'imageinfo' in page:
+                        info = page['imageinfo'][0]
+                        
+                        if self._is_relevant_image(info, query):
+                            image_data = {
+                                'url': info.get('thumburl') or info.get('url'),
+                                'title': page.get('title', '').replace('File:', ''),
+                                'description': self._extract_description(info),
+                                'source': 'wikimedia',
+                                'width': info.get('width'),
+                                'height': info.get('height'),
+                                'quality_score': self.calculate_image_quality(info),
+                                'page_url': f"https://commons.wikimedia.org/wiki/{page.get('title', '')}"
+                            }
+                            
+                            if image_data['url'] and image_data['quality_score'] >= config.MIN_IMAGE_QUALITY_SCORE:
+                                images.append(image_data)
+                                    
+                                if len(images) >= limit:
+                                    break
+            
+            images.sort(key=lambda x: x.get('quality_score', 0), reverse=True)
+            
+        except Exception as e:
+            logger.warning(f"Wikimedia fetch failed for {query}: {e}")
+        
+        return images[:limit]
+    
+    def fetch_from_wikipedia(self, page_title: str, limit: int = 6) -> List[Dict]:
+        images = []
+        
+        try:
+            params = {
+                'action': 'query',
+                'titles': page_title,
+                'prop': 'images|pageimages',
+                'pithumbsize': 1000,
+                'imlimit': 50,
+                'format': 'json'
+            }
+            
+            data = request_handler.get_json_cached(
+                self.wikipedia_api,
+                params=params,
+                cache_key=f"wikipedia_images:{page_title}",
+                ttl=config.CACHE_TTL_IMAGES
+            )
+            
+            pages = data.get('query', {}).get('pages', {})
+            file_titles = []
+            
+            for page in pages.values():
+                if 'thumbnail' in page:
+                    thumb = page['thumbnail']
+                    if thumb.get('source'):
+                        images.append({
+                            'url': thumb['source'],
+                            'title': f'Main image of {page_title}',
+                            'description': f'Featured image from Wikipedia',
+                            'source': 'wikipedia',
+                            'width': thumb.get('width'),
+                            'height': thumb.get('height'),
+                            'quality_score': 80,
+                            'page_url': f"https://en.wikipedia.org/wiki/{quote_plus(page_title)}"
+                        })
+                
+                for img in page.get('images', []):
+                    title = img.get('title', '')
+                    if title.startswith('File:'):
+                        lower_title = title.lower()
+                        if not any(x in lower_title for x in ['.svg', '.ogg', '.webm', '.tif']):
+                            file_titles.append(title)
+            
+            batch_size = 10
+            for i in range(0, min(len(file_titles), 30), batch_size):
+                batch = file_titles[i:i + batch_size]
+                titles_param = '|'.join(batch)
+                
+                params = {
+                    'action': 'query',
+                    'titles': titles_param,
+                    'prop': 'imageinfo',
+                    'iiprop': 'url|size|mime',
+                    'iiurlwidth': 800,
+                    'format': 'json'
+                }
+                
+                batch_data = request_handler.get_json_cached(
+                    self.wikipedia_api,
+                    params=params,
+                    cache_key=f"wikipedia_batch:{hashlib.md5(titles_param.encode()).hexdigest()}",
+                    ttl=config.CACHE_TTL_IMAGES
+                )
+                
+                for page in batch_data.get('query', {}).get('pages', {}).values():
+                    if 'imageinfo' in page:
+                        info = page['imageinfo'][0]
+                        mime = info.get('mime', '')
+                        
+                        if mime.startswith('image/'):
+                            image_data = {
+                                'url': info.get('thumburl') or info.get('url'),
+                                'title': page.get('title', '').replace('File:', ''),
+                                'description': f'Image from {page_title}',
+                                'source': 'wikipedia',
+                                'width': info.get('width'),
+                                'height': info.get('height'),
+                                'quality_score': self.calculate_image_quality(info),
+                                'page_url': f"https://en.wikipedia.org/wiki/{quote_plus(page_title)}"
+                            }
+                            
+                            if image_data['quality_score'] >= config.MIN_IMAGE_QUALITY_SCORE:
+                                images.append(image_data)
+                
+                if len(images) >= limit:
+                    break
+            
+            seen_urls = set()
+            unique_images = []
+            for img in sorted(images, key=lambda x: x.get('quality_score', 0), reverse=True):
+                if img['url'] not in seen_urls:
+                    seen_urls.add(img['url'])
+                    unique_images.append(img)
+            
+            return unique_images[:limit]
+            
+        except Exception as e:
+            logger.warning(f"Wikipedia image fetch failed for {page_title}: {e}")
+            return []
     
     def get_one_representative_image(self, city_name: str, page_title: str = None) -> Optional[Dict]:
         """Get ONLY ONE representative image for city preview"""
@@ -209,120 +653,151 @@ class IntelligentImageFetcher:
             return cached
         
         try:
-            # Try to get Wikipedia page image first
+            # Try to get Wikipedia page image first (usually most representative)
             if page_title:
                 params = {
                     'action': 'query',
                     'titles': page_title,
                     'prop': 'pageimages',
-                    'pithumbsize': 800,
+                    'pithumbsize': 1200,
                     'format': 'json'
                 }
                 
                 data = request_handler.get_json_cached(
                     self.wikipedia_api,
                     params=params,
-                    cache_key=f"wiki_page_image:{page_title}"
+                    cache_key=f"wiki_page_image:{page_title}",
+                    ttl=config.CACHE_TTL_IMAGES
                 )
                 
-                if data:
-                    pages = data.get('query', {}).get('pages', {})
-                    for page in pages.values():
-                        if 'thumbnail' in page:
-                            thumb = page['thumbnail']
-                            image = {
-                                'url': thumb['source'],
-                                'title': f'Image of {city_name}',
-                                'description': f'Featured image from Wikipedia',
-                                'source': 'wikipedia',
-                                'width': thumb.get('width'),
-                                'height': thumb.get('height')
-                            }
-                            cache.set(cache_key, image, config.CACHE_TTL_IMAGES)
-                            return image
+                pages = data.get('query', {}).get('pages', {})
+                for page in pages.values():
+                    if 'thumbnail' in page:
+                        thumb = page['thumbnail']
+                        image = {
+                            'url': thumb['source'],
+                            'title': f'Representative image of {city_name}',
+                            'description': f'Featured image from Wikipedia',
+                            'source': 'wikipedia',
+                            'width': thumb.get('width'),
+                            'height': thumb.get('height'),
+                            'quality_score': 85,
+                            'page_url': f"https://en.wikipedia.org/wiki/{quote_plus(page_title)}"
+                        }
+                        cache.set(cache_key, image, config.CACHE_TTL_IMAGES)
+                        return image
+            
+            # If no Wikipedia image, try to get one good city image
+            all_images = self.get_images_for_city(city_name, page_title, limit=3)
+            if all_images:
+                # Pick the best quality image
+                best_image = max(all_images, key=lambda x: x.get('quality_score', 0))
+                cache.set(cache_key, best_image, config.CACHE_TTL_IMAGES)
+                return best_image
+                
         except Exception as e:
-            logger.debug(f"Wikipedia image fetch failed: {e}")
+            logger.debug(f"Single image fetch failed: {e}")
         
-        # Fallback image
+        return None
+    
+    def get_images_for_city(self, city_name: str, page_title: str = None, limit: int = None) -> List[Dict]:
+        limit = limit or config.MAX_IMAGES_PER_REQUEST
+        images = []
+        seen_urls = set()
+        
+        # Try Wikipedia images
+        if len(images) < limit:
+            try:
+                wiki_images = self.fetch_from_wikipedia(page_title or city_name, limit - len(images))
+                for img in wiki_images:
+                    if img['url'] not in seen_urls:
+                        seen_urls.add(img['url'])
+                        images.append(img)
+                        
+                        if len(images) >= limit:
+                            break
+            except Exception as e:
+                logger.debug(f"Wikipedia images failed: {e}")
+        
+        # Try Wikimedia for cityscapes
+        if len(images) < limit:
+            try:
+                wikimedia_images = self.fetch_from_wikimedia(city_name, limit - len(images))
+                for img in wikimedia_images:
+                    if img['url'] not in seen_urls:
+                        seen_urls.add(img['url'])
+                        images.append(img)
+                        
+                        if len(images) >= limit:
+                            break
+            except Exception as e:
+                logger.debug(f"Wikimedia images failed: {e}")
+        
+        # Fallback
+        if not images and config.ENABLE_FALLBACK_IMAGES:
+            fallback = self.generate_fallback_image(city_name)
+            images.append(fallback)
+        
+        return images[:limit]
+    
+    def generate_fallback_image(self, city_name: str) -> Dict:
         encoded_city = quote_plus(city_name)
-        fallback_image = {
+        return {
             'url': f'https://images.unsplash.com/photo-1519681393784-d120267933ba?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80&txt={encoded_city}&txt-size=40&txt-color=white&txt-align=middle,center',
             'title': f'{city_name}',
             'description': f'Representation of {city_name}',
             'source': 'placeholder',
             'width': 800,
-            'height': 600
+            'height': 600,
+            'quality_score': 30,
+            'page_url': f'https://unsplash.com/s/photos/{encoded_city}-city'
         }
-        
-        cache.set(cache_key, fallback_image, config.CACHE_TTL_IMAGES)
-        return fallback_image
     
-    def get_images_for_city(self, city_name: str, page_title: str = None, limit: int = None) -> List[Dict]:
-        """Get multiple images for detailed view"""
-        limit = limit or config.MAX_IMAGES_PER_REQUEST
-        cache_key = f"all_images:{city_name}:{page_title}:{limit}"
+    def get_landmark_images(self, landmark_name: str, city_name: str = None) -> List[Dict]:
+        """Get images for a specific landmark"""
+        return self.landmark_fetcher.fetch_landmark_images(landmark_name, city_name)
+    
+    def _is_relevant_image(self, image_info: dict, query: str) -> bool:
+        mime = image_info.get('mime', '')
+        width = image_info.get('width', 0)
+        height = image_info.get('height', 0)
+        url = image_info.get('url', '').lower()
         
-        cached = cache.get(cache_key)
-        if cached:
-            return cached
+        if not mime.startswith('image/'):
+            return False
         
-        images = []
+        if width < config.MIN_IMAGE_WIDTH or height < config.MIN_IMAGE_HEIGHT:
+            return False
         
-        try:
-            # Try Wikipedia images
-            params = {
-                'action': 'query',
-                'titles': page_title or city_name,
-                'prop': 'images|pageimages',
-                'pithumbsize': 800,
-                'imlimit': limit,
-                'format': 'json'
-            }
-            
-            data = request_handler.get_json_cached(
-                self.wikipedia_api,
-                params=params,
-                cache_key=f"wikipedia_images:{page_title or city_name}"
-            )
-            
-            if data:
-                pages = data.get('query', {}).get('pages', {})
-                for page in pages.values():
-                    if 'thumbnail' in page:
-                        thumb = page['thumbnail']
-                        images.append({
-                            'url': thumb['source'],
-                            'title': f'Main image of {city_name}',
-                            'description': 'Featured image from Wikipedia',
-                            'source': 'wikipedia',
-                            'width': thumb.get('width'),
-                            'height': thumb.get('height')
-                        })
-        except Exception as e:
-            logger.debug(f"Wikipedia images failed: {e}")
+        if not any(fmt in url for fmt in config.PREFERRED_IMAGE_FORMATS):
+            return False
         
-        # If we don't have enough images, add fallbacks
-        while len(images) < min(limit, 3):
-            encoded_city = quote_plus(city_name)
-            images.append({
-                'url': f'https://images.unsplash.com/photo-1519681393784-d120267933ba?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80&txt={encoded_city}&txt-size=40&txt-color=white&txt-align=middle,center',
-                'title': f'{city_name}',
-                'description': f'Representation of {city_name}',
-                'source': 'placeholder',
-                'width': 800,
-                'height': 600
-            })
+        if width > 0 and height > 0:
+            ratio = width / height
+            if ratio < 0.3 or ratio > 3.0:
+                return False
         
-        cache.set(cache_key, images, config.CACHE_TTL_IMAGES)
-        return images[:limit]
+        return True
+    
+    def _extract_description(self, image_info: dict) -> str:
+        extmetadata = image_info.get('extmetadata', {})
+        
+        for field in ['ImageDescription', 'ObjectName', 'Caption']:
+            if field in extmetadata:
+                value = extmetadata[field].get('value', '')
+                if isinstance(value, str) and value.strip():
+                    clean_value = re.sub(r'<[^>]+>', '', value)
+                    return clean_value
+        
+        return ""
 
 image_fetcher = IntelligentImageFetcher()
 
-# ==================== CITY DATA PROVIDER (OPTIMIZED) ====================
-class CityDataProvider:
+# ==================== ENHANCED CITY DATA PROVIDER ====================
+class EnhancedCityDataProvider:
     def __init__(self):
         self.geolocator = Nominatim(
-            user_agent="CityExplorer/2.0 (https://traveltto.com)",
+            user_agent="CityExplorer/2.0 (https://traveltto.com; contact@traveltto.com)",
             timeout=config.GEOLOCATOR_TIMEOUT
         )
         self.wiki = wikipediaapi.Wikipedia(
@@ -330,6 +805,172 @@ class CityDataProvider:
             user_agent='CityExplorer/2.0 (https://traveltto.com)',
             extract_format=wikipediaapi.ExtractFormat.WIKI
         )
+        self.map_provider = MapProvider()
+        self.stats = {
+            'previews_generated': 0,
+            'details_generated': 0,
+            'coordinates_found': 0,
+            'coordinates_failed': 0,
+            'wiki_found': 0,
+            'wiki_failed': 0,
+            'images_found': 0,
+            'images_failed': 0
+        }
+    
+    def get_coordinates_enhanced(self, city_name: str, country: str = None, 
+                                region: str = None) -> Optional[Tuple[float, float, Dict]]:
+        cache_key = f"coords:{city_name}:{country}"
+        
+        cached = cache.get(cache_key)
+        if cached:
+            self.stats['coordinates_found'] += 1
+            return cached
+        
+        strategies = [
+            self._get_coordinates_nominatim,
+            self._get_coordinates_wikipedia,
+            self._get_coordinates_wikidata,
+        ]
+        
+        for strategy in strategies:
+            try:
+                result = strategy(city_name, country, region)
+                if result:
+                    lat, lon, metadata = result
+                    
+                    if -90 <= lat <= 90 and -180 <= lon <= 180:
+                        cache.set(cache_key, result, config.CACHE_TTL_COORDS)
+                        self.stats['coordinates_found'] += 1
+                        
+                        logger.info(f"✅ Coordinates found for {city_name}: {lat}, {lon}")
+                        return result
+            except Exception as e:
+                logger.debug(f"Coordinate strategy failed for {city_name}: {e}")
+                continue
+        
+        self.stats['coordinates_failed'] += 1
+        logger.warning(f"❌ No coordinates found for {city_name}")
+        return None
+    
+    def _get_coordinates_nominatim(self, city_name: str, country: str = None, 
+                                  region: str = None) -> Optional[Tuple[float, float, Dict]]:
+        queries = []
+        
+        if country:
+            queries.append(f"{city_name}, {country}")
+            if region:
+                queries.append(f"{city_name}, {region}, {country}")
+        
+        queries.append(f"{city_name}")
+        queries.append(f"{city_name} city")
+        
+        for query in queries:
+            try:
+                location = self.geolocator.geocode(
+                    query,
+                    exactly_one=True,
+                    addressdetails=True,
+                    language="en",
+                    timeout=config.GEOLOCATOR_TIMEOUT
+                )
+                
+                if location and hasattr(location, 'latitude'):
+                    metadata = getattr(location, 'raw', {})
+                    metadata['source'] = 'nominatim'
+                    metadata['query_used'] = query
+                    
+                    return (location.latitude, location.longitude, metadata)
+                    
+            except Exception as e:
+                logger.debug(f"Nominatim query failed for '{query}': {e}")
+                continue
+        
+        return None
+    
+    def _get_coordinates_wikipedia(self, city_name: str, country: str = None, 
+                                  region: str = None) -> Optional[Tuple[float, float, Dict]]:
+        try:
+            page = self.wiki.page(city_name)
+            if not page.exists():
+                if country:
+                    page = self.wiki.page(f"{city_name}, {country}")
+            
+            if page.exists():
+                api_url = "https://en.wikipedia.org/w/api.php"
+                params = {
+                    'action': 'query',
+                    'titles': page.title,
+                    'prop': 'coordinates',
+                    'format': 'json'
+                }
+                
+                data = request_handler.get_json_cached(
+                    api_url,
+                    params=params,
+                    cache_key=f"wiki_coords:{page.title}"
+                )
+                
+                pages = data.get('query', {}).get('pages', {})
+                for page_data in pages.values():
+                    coords = page_data.get('coordinates')
+                    if coords and len(coords) > 0:
+                        coord = coords[0]
+                        return (
+                            coord['lat'],
+                            coord['lon'],
+                            {'source': 'wikipedia', 'page_title': page.title, 'page_url': f"https://en.wikipedia.org/wiki/{quote_plus(page.title)}"}
+                        )
+                        
+        except Exception as e:
+            logger.debug(f"Wikipedia coordinate fetch failed: {e}")
+        
+        return None
+    
+    def _get_coordinates_wikidata(self, city_name: str, country: str = None, 
+                                 region: str = None) -> Optional[Tuple[float, float, Dict]]:
+        try:
+            search_url = "https://www.wikidata.org/w/api.php"
+            params = {
+                'action': 'wbsearchentities',
+                'search': city_name,
+                'language': 'en',
+                'format': 'json',
+                'type': 'item'
+            }
+            
+            if country:
+                params['search'] = f"{city_name} {country}"
+            
+            search_data = request_handler.get_json_cached(
+                search_url,
+                params=params,
+                cache_key=f"wikidata_search:{city_name}:{country}"
+            )
+            
+            if search_data.get('search'):
+                entity_id = search_data['search'][0]['id']
+                
+                entity_url = f"https://www.wikidata.org/wiki/Special:EntityData/{entity_id}.json"
+                entity_data = request_handler.get_json_cached(
+                    entity_url,
+                    cache_key=f"wikidata_entity:{entity_id}"
+                )
+                
+                entity = entity_data.get('entities', {}).get(entity_id, {})
+                claims = entity.get('claims', {})
+                
+                if 'P625' in claims:
+                    coord_claim = claims['P625'][0]['mainsnak']['datavalue']['value']
+                    return (
+                        coord_claim['latitude'],
+                        coord_claim['longitude'],
+                        {'source': 'wikidata', 'entity_id': entity_id, 'entity_url': f"https://www.wikidata.org/wiki/{entity_id}"}
+                    )
+                    
+        except Exception as e:
+            logger.debug(f"Wikidata coordinate fetch failed: {e}")
+        
+        return None
     
     def _get_short_description(self, city_name: str, country: str = None) -> Tuple[Optional[str], Optional[str]]:
         """Get only 1-2 sentences for preview"""
@@ -339,138 +980,554 @@ class CityDataProvider:
         if cached:
             return cached.get('description'), cached.get('title')
         
-        variations = [city_name]
-        if country:
-            variations.append(f"{city_name}, {country}")
+        variations = self._generate_wiki_variations(city_name, country)
         
         for variation in variations:
             try:
                 page = self.wiki.page(variation)
+                
                 if page.exists() and page.ns == 0:
-                    summary = page.summary or ""
-                    if summary:
-                        # Get first 2 sentences max
-                        sentences = re.split(r'[.!?]', summary)
-                        short_desc = ""
-                        sentence_count = 0
-                        for sentence in sentences:
-                            if sentence.strip():
-                                short_desc += sentence.strip() + '. '
-                                sentence_count += 1
-                                if sentence_count >= 2:
-                                    break
-                        
-                        short_desc = short_desc.strip()
-                        if short_desc:
-                            cache.set(cache_key, {
-                                'description': short_desc,
-                                'title': page.title
-                            }, config.CACHE_TTL_PREVIEW)
-                            return short_desc, page.title
-            except Exception:
+                    if self._is_city_page(page):
+                        summary = page.summary or ""
+                        if summary:
+                            # Get first 2 sentences max
+                            sentences = re.split(r'[.!?]', summary)
+                            short_desc = ""
+                            sentence_count = 0
+                            for sentence in sentences:
+                                if sentence.strip():
+                                    short_desc += sentence.strip() + '. '
+                                    sentence_count += 1
+                                    if sentence_count >= 2:
+                                        break
+                            
+                            short_desc = short_desc.strip()
+                            if short_desc:
+                                cache.set(cache_key, {
+                                    'description': short_desc,
+                                    'title': page.title
+                                }, config.CACHE_TTL_PREVIEW)
+                                return short_desc, page.title
+            except Exception as e:
+                logger.debug(f"Short description check failed: {e}")
                 continue
         
         return None, None
     
-    def get_coordinates(self, city_name: str, country: str = None) -> Optional[Dict[str, float]]:
-        """Get coordinates with caching"""
-        cache_key = f"coords:{city_name}:{country}"
+    def get_wikipedia_data_enhanced(self, city_name: str, country: str = None) -> Tuple[Optional[Dict], Optional[str]]:
+        cache_key = f"wiki:{city_name}:{country}"
+        
+        cached = cache.get(cache_key)
+        if cached:
+            self.stats['wiki_found'] += 1
+            return cached.get('data'), cached.get('title')
+        
+        variations = self._generate_wiki_variations(city_name, country)
+        
+        for variation in variations:
+            try:
+                page = self.wiki.page(variation)
+                
+                if page.exists() and page.ns == 0:
+                    if self._is_city_page(page):
+                        page_data = self._extract_wiki_data(page)
+                        cache.set(cache_key, {
+                            'data': page_data,
+                            'title': page.title
+                        }, config.CACHE_TTL)
+                        
+                        self.stats['wiki_found'] += 1
+                        logger.info(f"✅ Wikipedia page found for {city_name}: {page.title}")
+                        return page_data, page.title
+                        
+            except Exception as e:
+                logger.debug(f"Wikipedia check failed for '{variation}': {e}")
+                continue
+        
+        self.stats['wiki_failed'] += 1
+        logger.warning(f"❌ No Wikipedia page found for {city_name}")
+        return None, None
+    
+    def _generate_wiki_variations(self, city_name: str, country: str = None) -> List[str]:
+        variations = [city_name]
+        
+        if country:
+            variations.extend([
+                f"{city_name}, {country}",
+                f"{city_name} ({country})",
+                f"{city_name} City, {country}"
+            ])
+        
+        variations.extend([
+            f"{city_name} city",
+            f"{city_name} (city)",
+            f"The city of {city_name}",
+            city_name.split(',')[0].strip() if ',' in city_name else city_name
+        ])
+        
+        return list(dict.fromkeys([v for v in variations if v.strip()]))
+    
+    def _is_city_page(self, page) -> bool:
+        try:
+            text_lower = (page.summary or "").lower()
+            
+            city_indicators = [
+                'city', 'town', 'municipality', 'capital', 'population',
+                'located in', 'situated in', 'urban area'
+            ]
+            
+            non_city_indicators = [
+                'river', 'mountain', 'lake', 'island', 'species',
+                'album', 'song', 'film', 'book', 'company'
+            ]
+            
+            city_score = sum(1 for indicator in city_indicators if indicator in text_lower)
+            non_city_score = sum(1 for indicator in non_city_indicators if indicator in text_lower)
+            
+            return city_score > non_city_score and city_score >= 1
+            
+        except Exception:
+            return True
+    
+    def _extract_wiki_data(self, page) -> Dict:
+        sections = []
+        
+        def extract_section_content(section, max_depth=3, current_depth=0):
+            if current_depth >= max_depth:
+                return
+            
+            title = section.title.strip()
+            text = (section.text or "").strip()
+            
+            if title and text and title not in ["See also", "References", "External links", "Notes", "Bibliography"]:
+                cleaned = clean_text(text)
+                
+                if cleaned:
+                    sections.append({
+                        "title": title,
+                        "content": cleaned,
+                        "length": len(cleaned)
+                    })
+            
+            for subsection in getattr(section, 'sections', []):
+                extract_section_content(subsection, max_depth, current_depth + 1)
+        
+        for section in getattr(page, 'sections', []):
+            extract_section_content(section)
+        
+        full_summary = clean_text(page.summary or "")
+        
+        return {
+            'title': page.title,
+            'summary': full_summary,
+            'fullurl': getattr(page, 'fullurl', f"https://en.wikipedia.org/wiki/{quote_plus(page.title)}"),
+            'sections': sections,
+            'pageid': getattr(page, 'pageid', None),
+            'text_length': len(full_summary),
+            'sections_count': len(sections)
+        }
+    
+    def get_city_tagline_enhanced(self, city_name: str, country: str = None) -> Dict[str, str]:
+        cache_key = f"tagline:{city_name}:{country}"
         
         cached = cache.get(cache_key)
         if cached:
             return cached
         
         try:
-            query = f"{city_name}, {country}" if country else city_name
-            location = self.geolocator.geocode(
-                query,
-                exactly_one=True,
-                timeout=config.GEOLOCATOR_TIMEOUT
-            )
-            
-            if location and hasattr(location, 'latitude'):
-                coords = {"lat": location.latitude, "lon": location.longitude}
-                cache.set(cache_key, coords, config.CACHE_TTL)
-                return coords
+            summary, _ = self._get_short_description(city_name, country)
+            if summary:
+                # Use first sentence as tagline
+                sentences = re.split(r'[.!?]', summary)
+                if sentences and sentences[0]:
+                    tagline = sentences[0].strip()
+                    if tagline:
+                        result = {"city": city_name, "tagline": tagline, "source": "wikipedia"}
+                        cache.set(cache_key, result, config.CACHE_TTL)
+                        return result
         except Exception as e:
-            logger.debug(f"Coordinates fetch failed for {city_name}: {e}")
+            logger.debug(f"Tagline extraction failed: {e}")
         
-        return None
+        # Generic tagline
+        if country:
+            tagline = f"A city in {country}"
+        else:
+            tagline = f"Discover {city_name}"
+        
+        result = {"city": city_name, "tagline": tagline, "source": "generated"}
+        cache.set(cache_key, result, config.CACHE_TTL)
+        return result
     
-    def get_city_preview(self, city_name: str, country: str = None, region: str = None) -> Dict:
-        """Get minimal preview data for city list"""
-        cache_key = f"preview:{city_name}:{country}:{region}"
+    def get_city_preview_minimal(self, city_name: str, country: str = None, 
+                                 region: str = None) -> Dict:
+        """MINIMAL preview for /api/cities - ONLY name, 1 image, short desc, coords, region"""
+        cache_key = f"minimal_preview:{city_name}:{country}:{region}"
         
         cached = cache.get(cache_key)
         if cached:
             return cached
         
-        # Get short description
-        short_desc, wiki_title = self._get_short_description(city_name, country)
+        self.stats['previews_generated'] += 1
+        logger.info(f"🔄 Generating MINIMAL preview for {city_name}")
         
-        # Get one image
-        image = image_fetcher.get_one_representative_image(city_name, wiki_title)
-        
-        # Get coordinates
-        coordinates = self.get_coordinates(city_name, country)
-        
-        # Create preview
+        # Start with absolute minimal structure
         preview = {
-            "id": city_name.lower().replace(' ', '-'),
+            "id": self._generate_city_id(city_name),
             "name": city_name,
-            "display_name": wiki_title or city_name,
+            "display_name": city_name,
+            "summary": "",  # Will be short description
+            "has_details": False,
+            "image": None,  # ONLY ONE image
+            "images": [],   # EMPTY - no images array
+            "coordinates": None,
+            "static_map": None,
+            "tagline": None,
+            "last_updated": time.time(),
             "country": country,
             "region": region,
-            "image": image,
-            "description": short_desc or f"Discover {city_name}, a city in {country or 'the world'}",
-            "coordinates": coordinates,
-            "has_details": True
+            "landmarks": [],  # EMPTY - no landmarks in preview
+            "metadata": {
+                "data_type": "minimal_preview"
+            }
         }
         
+        # Get coordinates
+        try:
+            coords_result = self.get_coordinates_enhanced(city_name, country, region)
+            if coords_result:
+                lat, lon, metadata = coords_result
+                preview["coordinates"] = {"lat": lat, "lon": lon}
+                
+                # Generate static map
+                preview["static_map"] = self.map_provider.generate_static_map_url(
+                    {"lat": lat, "lon": lon}, width=400, height=250
+                )
+        except Exception as e:
+            logger.warning(f"Coordinates fetch failed for {city_name}: {e}")
+        
+        # Get short description
+        try:
+            short_desc, wiki_title = self._get_short_description(city_name, country)
+            if short_desc:
+                preview["display_name"] = wiki_title or city_name
+                preview["summary"] = short_desc
+                preview["_wiki_title"] = wiki_title or city_name
+            else:
+                preview["summary"] = f"Discover {city_name}, a city in {country or 'the world'}"
+        except Exception as e:
+            logger.warning(f"Description fetch failed for {city_name}: {e}")
+        
+        # Get ONE image only
+        try:
+            wiki_title = preview.get("_wiki_title", city_name)
+            image = image_fetcher.get_one_representative_image(city_name, wiki_title)
+            
+            if image:
+                preview["image"] = image
+                self.stats['images_found'] += 1
+            else:
+                self.stats['images_failed'] += 1
+                # Add fallback image
+                fallback_image = image_fetcher.generate_fallback_image(city_name)
+                preview["image"] = fallback_image
+                
+        except Exception as e:
+            logger.error(f"Image fetch failed for {city_name}: {e}")
+            self.stats['images_failed'] += 1
+            fallback_image = image_fetcher.generate_fallback_image(city_name)
+            preview["image"] = fallback_image
+        
+        # Get tagline
+        try:
+            tagline_data = self.get_city_tagline_enhanced(city_name, country)
+            preview["tagline"] = tagline_data.get("tagline")
+        except Exception as e:
+            logger.debug(f"Tagline fetch failed: {e}")
+            preview["tagline"] = f"Discover {city_name}"
+        
+        # Cache the minimal preview
         cache.set(cache_key, preview, config.CACHE_TTL_PREVIEW)
+        
+        logger.info(f"✅ Minimal preview generated for {city_name}")
         return preview
     
-    def get_city_details(self, city_name: str, country: str = None, region: str = None) -> Dict:
-        """Get full details for individual city"""
+    def get_city_details_enhanced(self, city_name: str, country: str = None, 
+                                 region: str = None) -> Dict:
+        """FULL details for individual city page"""
         cache_key = f"details:{city_name}:{country}:{region}"
         
         cached = cache.get(cache_key)
         if cached:
+            self.stats['details_generated'] += 1
             return cached
         
-        # Start with preview
-        preview = self.get_city_preview(city_name, country, region)
+        self.stats['details_generated'] += 1
+        logger.info(f"🔄 Generating FULL details for {city_name}")
         
-        # Get all images
-        _, wiki_title = self._get_short_description(city_name, country)
-        all_images = image_fetcher.get_images_for_city(city_name, wiki_title)
+        # Start with minimal preview data
+        preview = self.get_city_preview_minimal(city_name, country, region)
         
-        # Build details
+        # Build full details
         details = {
             **preview,
-            "all_images": all_images,
-            "image_count": len(all_images),
-            "landmarks": [],  # Would extract from Wikipedia if needed
-            "wiki_summary": preview.get("description", ""),
-            "detailed_info_available": True
+            "detailed_summary": "",
+            "sections": [],
+            "sources": [],
+            "map_config": {},
+            "additional_images": [],
+            "statistics": {},
+            "landmarks": [],  # Will be populated with landmarks
+            "metadata": {
+                **preview.get("metadata", {}),
+                "data_type": "full_details",
+                "loaded_at": time.time()
+            }
+        }
+        
+        # Get full Wikipedia data
+        wiki_data, wiki_title = self.get_wikipedia_data_enhanced(city_name, country)
+        if wiki_data:
+            details["detailed_summary"] = wiki_data.get('summary', '')
+            details["sources"].append(wiki_data.get('fullurl', ''))
+            
+            # Include sections
+            sections_data = []
+            for section in wiki_data.get('sections', []):
+                if section.get('content'):
+                    sections_data.append({
+                        "title": section.get('title'),
+                        "content": section.get('content')
+                    })
+            details["sections"] = sections_data
+            
+            # Extract landmarks from Wikipedia content
+            landmarks = self._extract_landmarks(wiki_data)
+            details["landmarks"] = landmarks
+        
+        # Get additional images
+        try:
+            additional_images = image_fetcher.get_images_for_city(
+                city_name,
+                wiki_title or city_name,
+                limit=config.MAX_IMAGES_PER_REQUEST
+            )
+            
+            if additional_images:
+                # Update images array with all images
+                details["images"] = additional_images
+                # Keep first as main image
+                if additional_images and not details.get("image"):
+                    details["image"] = additional_images[0]
+                # Set additional_images to all but first
+                details["additional_images"] = additional_images[1:min(6, len(additional_images))]
+        except Exception as e:
+            logger.warning(f"Additional images failed for {city_name}: {e}")
+        
+        details["map_config"] = self.map_provider.get_map_config(
+            city_name,
+            details.get("coordinates")
+        )
+        
+        # Mark that details are loaded
+        details["has_details"] = True
+        
+        details["statistics"] = {
+            "image_count": len(details.get("images", [])),
+            "section_count": len(details.get("sections", [])),
+            "landmark_count": len(details.get("landmarks", [])),
+            "last_updated": time.time()
         }
         
         cache.set(cache_key, details, config.CACHE_TTL)
+        
+        logger.info(f"✅ Details generated for {city_name}")
         return details
+    
+    def _extract_landmarks(self, wiki_data: Dict) -> List[Dict]:
+        """Extract landmarks from Wikipedia data"""
+        landmarks = []
+        
+        # Look for sections that might contain landmarks
+        landmark_sections = ['Landmarks', 'Attractions', 'Tourist attractions', 
+                           'Architecture', 'Monuments', 'Places of interest']
+        
+        for section in wiki_data.get('sections', []):
+            section_title = section.get('title', '').lower()
+            section_content = section.get('content', '')
+            
+            # Check if this section is about landmarks
+            if any(keyword in section_title for keyword in [s.lower() for s in landmark_sections]):
+                # Parse content to find specific landmarks
+                lines = section_content.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if len(line) > 10 and any(word in line.lower() for word in ['building', 'tower', 'palace', 'castle', 'museum', 
+                                                                                'church', 'mosque', 'temple', 'statue', 'monument']):
+                        # Try to extract landmark name (first part before comma or period)
+                        name_parts = line.split(',')[0].split('.')[0].split(' is ')[0].split(' was ')[0]
+                        landmark_name = name_parts.strip()
+                        
+                        if len(landmark_name) > 3 and landmark_name not in [l['name'] for l in landmarks]:
+                            landmarks.append({
+                                "name": landmark_name,
+                                "description": line[:200] + '...' if len(line) > 200 else line,
+                                "images": []  # Will be populated when needed
+                            })
+        
+        # If no specific landmarks found, use some generic ones
+        if not landmarks:
+            summary = wiki_data.get('summary', '')
+            sentences = summary.split('.')
+            for i, sentence in enumerate(sentences[:5]):
+                if len(sentence.strip()) > 20:
+                    landmarks.append({
+                        "name": f"Notable Site {i+1}",
+                        "description": sentence.strip(),
+                        "images": []
+                    })
+        
+        return landmarks[:10]  # Limit to 10 landmarks
+    
+    def _generate_city_id(self, city_name: str) -> str:
+        city_id = city_name.lower().strip()
+        city_id = re.sub(r'[^\w\s-]', '', city_id)
+        city_id = re.sub(r'[-\s]+', '-', city_id)
+        return city_id
+    
+    def get_stats(self):
+        return self.stats
 
-data_provider = CityDataProvider()
+# ==================== MAP PROVIDER ====================
+class MapProvider:
+    def __init__(self):
+        self.tile_providers = {
+            "openstreetmap": {
+                "url": "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+                "attribution": "© OpenStreetMap contributors",
+                "requires_token": False
+            },
+            "carto": {
+                "url": "https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+                "attribution": "© OpenStreetMap & CARTO",
+                "requires_token": False
+            },
+            "opentopomap": {
+                "url": "https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+                "attribution": "© OpenStreetMap & OpenTopoMap",
+                "requires_token": False
+            }
+        }
+        
+        if config.MAPBOX_ACCESS_TOKEN:
+            self.tile_providers["mapbox"] = {
+                "url": f"https://api.mapbox.com/styles/v1/mapbox/light-v10/tiles/{{z}}/{{x}}/{{y}}?access_token={config.MAPBOX_ACCESS_TOKEN}",
+                "attribution": "© Mapbox & OpenStreetMap",
+                "requires_token": True
+            }
+    
+    def get_map_config(self, city_name: str, coordinates: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
+        provider_key = config.MAP_TILE_PROVIDER
+        
+        if provider_key not in self.tile_providers:
+            provider_key = "openstreetmap"
+            logger.warning(f"Map provider {config.MAP_TILE_PROVIDER} not found, using {provider_key}")
+        
+        provider_config = self.tile_providers[provider_key]
+        
+        map_config = {
+            "tile_provider": provider_key,
+            "tile_url": provider_config["url"],
+            "attribution": provider_config["attribution"],
+            "zoom": 12,
+            "min_zoom": 2,
+            "max_zoom": 18,
+            "center": {"lat": 0, "lon": 0},
+            "marker": None
+        }
+        
+        if coordinates and self._validate_coordinates(coordinates):
+            map_config.update({
+                "center": coordinates,
+                "marker": {
+                    "coordinates": coordinates,
+                    "popup_content": f"<strong>{city_name}</strong>",
+                    "color": "#3388ff",
+                    "icon": "circle"
+                }
+            })
+        
+        return map_config
+    
+    def generate_static_map_url(self, coordinates: Optional[Dict[str, float]], 
+                               width: int = 600, height: int = 400,
+                               zoom: int = 12) -> str:
+        
+        if not coordinates or not self._validate_coordinates(coordinates):
+            return f"https://via.placeholder.com/{width}x{height}.png?text=Map+Not+Available"
+        
+        lat, lon = coordinates["lat"], coordinates["lon"]
+        
+        if config.MAPBOX_ACCESS_TOKEN:
+            try:
+                return f"https://api.mapbox.com/styles/v1/mapbox/light-v10/static/pin-l+3388ff({lon},{lat})/{lon},{lat},{zoom}/{width}x{height}?access_token={config.MAPBOX_ACCESS_TOKEN}"
+            except Exception:
+                pass
+        
+        try:
+            return f"https://staticmap.openstreetmap.de/staticmap.php?center={lat},{lon}&zoom={zoom}&size={width}x{height}&markers={lat},{lon},red-pushpin&scale=2"
+        except Exception:
+            pass
+        
+        return f"https://via.placeholder.com/{width}x{height}.png?text={lat:.4f}%2C{lon:.4f}"
+    
+    def _validate_coordinates(self, coordinates: Dict[str, float]) -> bool:
+        try:
+            lat = coordinates.get("lat")
+            lon = coordinates.get("lon")
+            
+            if lat is None or lon is None:
+                return False
+            
+            try:
+                lat = float(lat)
+                lon = float(lon)
+            except (ValueError, TypeError):
+                return False
+            
+            return (-90 <= lat <= 90 and -180 <= lon <= 180)
+            
+        except Exception:
+            return False
 
-# ==================== FLASK APP ====================
+# ==================== TEXT PROCESSING HELPERS ====================
+def clean_text(text: str) -> str:
+    if not text:
+        return ""
+    
+    cleaned = re.sub(r'\[\d+\]', '', text)
+    cleaned = re.sub(r'\{\{.*?\}\}', '', cleaned)
+    cleaned = re.sub(r'<[^>]+>', '', cleaned)
+    
+    cleaned = re.sub(r'\n\s*\n', '\n\n', cleaned)
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    
+    return cleaned.strip()
+
+# ==================== FLASK APP & ROUTES ====================
 app = Flask(__name__)
 
+# Restrict CORS to only your two domains
 CORS(app, 
-     origins=["https://www.traveltto.com", "http://localhost:3000"],
+     origins=config.ALLOWED_ORIGINS,
      methods=["GET", "OPTIONS"],
      allow_headers=["Content-Type", "Authorization"],
      supports_credentials=False,
      max_age=3600)
 
-# ==================== WORLD CITIES DATA ====================
+# Initialize providers
+data_provider = EnhancedCityDataProvider()
+image_fetcher = IntelligentImageFetcher()
+
 WORLD_CITIES = [
     # EUROPE (Expanded - 200+ cities)
     {"name":"Paris","country":"France","region":"Europe"},
@@ -1587,149 +2644,153 @@ WORLD_CITIES = [
     {"name":"South Tarawa","country":"Kiribati","region":"Oceania"},
 ]
 
-# Create lookup dictionaries for faster filtering
-CITIES_BY_REGION = {}
-CITIES_BY_COUNTRY = {}
 
-for city in WORLD_CITIES:
-    region = city.get('region')
-    country = city.get('country')
-    
-    if region:
-        if region not in CITIES_BY_REGION:
-            CITIES_BY_REGION[region] = []
-        CITIES_BY_REGION[region].append(city)
-    
-    if country:
-        if country not in CITIES_BY_COUNTRY:
-            CITIES_BY_COUNTRY[country] = []
-        CITIES_BY_COUNTRY[country].append(city)
+# Filter out only Moroccan cities from WORLD_CITIES
+MOROCCAN_CITIES = [city for city in WORLD_CITIES if city.get('country') == 'Morocco']
 
-# Get unique regions from data
-REGIONS = sorted(list(set(city.get('region') for city in WORLD_CITIES if city.get('region'))))
+# ==================== ROUTES ====================
 
 @app.route('/')
 def home():
     return jsonify({
         "name": "City Explorer API",
-        "version": "3.0.0",
+        "version": "2.0.0",
         "status": "operational",
-        "mode": "optimized-with-caching",
-        "description": "/api/cities returns name, region, description, and ONE image per city with smart caching",
-        "features": [
-            "Region filtering for faster loading",
-            "Smart caching (memory, Redis, disk)",
-            "Real Wikipedia images and descriptions",
-            "Individual city details on demand"
-        ],
+        "description": "API for exploring cities worldwide with separate minimal preview and full details",
         "endpoints": {
             "health": "/api/health",
-            "cities": "/api/cities?region=Europe (filter by region/country)",
-            "city_details": "/api/cities/<city_name> (full details)",
+            "cities": "/api/cities (50 per page, minimal data)",
+            "city_details": "/api/cities/<city_name> (full details with landmarks)",
+            "landmark_images": "/api/cities/<city_name>/landmarks/<landmark_name>/images",
+            "morocco": "/api/morocco (Moroccan cities only)",
+            "morocco_city": "/api/morocco/<city_name> (Moroccan city details)",
             "search": "/api/search",
-            "regions": "/api/regions"
+            "stats": "/api/stats"
         },
-        "total_cities": len(WORLD_CITIES)
+        "cors": {
+            "allowed_origins": config.ALLOWED_ORIGINS,
+            "note": "API is restricted to traveltto.com domains only"
+        }
     })
 
 @app.route('/api/health')
 def health():
+    cache_stats = cache.get_stats()
+    request_stats = request_handler.get_performance_stats()
+    provider_stats = data_provider.get_stats()
+    
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
+        "cors_allowed": config.ALLOWED_ORIGINS,
         "world_cities_count": len(WORLD_CITIES),
-        "unique_regions": len(REGIONS),
-        "cache_enabled": True,
-        "performance_mode": "optimized"
-    })
-
-@app.route('/api/regions')
-def get_regions():
-    """Get all available regions"""
-    return jsonify({
-        "success": True,
-        "regions": REGIONS,
-        "count": len(REGIONS)
+        "moroccan_cities_count": len(MOROCCAN_CITIES),
+        "cache": cache_stats,
+        "performance": request_stats,
+        "provider_stats": provider_stats
     })
 
 @app.route('/api/cities')
 def get_cities():
     """
-    OPTIMIZED ENDPOINT: Returns ONLY name, region, description, and ONE image per city
-    - Supports region/country filtering for faster loading
-    - Uses smart caching for instant responses after first load
-    - Real Wikipedia images and descriptions
+    ENDPOINT 1: Returns ONLY name, region, small description and 1 image for each city
+    - Loads 50 cities per page (faster loading)
+    - Minimal data for listing page
     """
+    page = request.args.get('page', 1, type=int)
+    limit = request.args.get('limit', config.CITIES_PER_PAGE, type=int)  # Use config setting
     region = request.args.get('region', type=str)
     country = request.args.get('country', type=str)
-    page = request.args.get('page', 1, type=int)
-    limit = request.args.get('limit', 50, type=int)
     
-    # Check cache first
-    cache_key = f"cities_list:{region}:{country}:{page}:{limit}"
-    cached_data = cache.get(cache_key)
-    if cached_data:
-        logger.info(f"📊 Cache hit for cities (region={region}, country={country})")
+    # Ensure limit doesn't exceed 50
+    limit = min(max(1, limit), config.CITIES_PER_PAGE)
+    page = max(1, page)
+    
+    logger.info(f"📊 /api/cities called - page {page}, limit {limit}")
+    
+    if len(WORLD_CITIES) == 0:
         return jsonify({
             "success": True,
-            "data": cached_data,
-            "total": len(cached_data),
-            "filtered_by": {"region": region, "country": country} if region or country else "all",
-            "cached": True
+            "data": [],
+            "pagination": {
+                "page": page,
+                "limit": limit,
+                "total": 0,
+                "pages": 1,
+                "next_page": None,
+                "prev_page": None
+            },
+            "mode": "minimal_preview"
         })
     
-    # Filter cities efficiently using pre-built dictionaries
-    if region and region in CITIES_BY_REGION:
-        filtered_cities = CITIES_BY_REGION[region]
-    elif country and country in CITIES_BY_COUNTRY:
-        filtered_cities = CITIES_BY_COUNTRY[country]
-    else:
-        filtered_cities = WORLD_CITIES
+    # Filter cities
+    filtered_cities = WORLD_CITIES
+    if region:
+        filtered_cities = [c for c in filtered_cities if c.get('region') == region]
+    if country:
+        filtered_cities = [c for c in filtered_cities if c.get('country') == country]
     
-    # Apply pagination
     total_cities = len(filtered_cities)
     start_idx = (page - 1) * limit
     end_idx = min(start_idx + limit, total_cities)
     
-    logger.info(f"📊 Processing {len(filtered_cities[start_idx:end_idx])} cities (region={region}, country={country})")
-    
-    # Process cities in parallel for faster loading
     cities_list = []
     
-    def process_city(city_info):
-        try:
-            return data_provider.get_city_preview(
+    # Use ThreadPoolExecutor to fetch multiple cities concurrently
+    with ThreadPoolExecutor(max_workers=min(10, limit)) as executor:
+        future_to_city = {}
+        
+        for i in range(start_idx, end_idx):
+            city_info = filtered_cities[i]
+            future = executor.submit(
+                data_provider.get_city_preview_minimal,
                 city_info['name'],
                 city_info.get('country'),
                 city_info.get('region')
             )
-        except Exception as e:
-            logger.warning(f"Failed to load {city_info['name']}: {e}")
-            return {
-                "id": city_info['name'].lower().replace(' ', '-'),
-                "name": city_info['name'],
-                "display_name": city_info['name'],
-                "country": city_info.get('country'),
-                "region": city_info.get('region'),
-                "image": {
-                    "url": f"https://via.placeholder.com/400x300.png?text={quote_plus(city_info['name'])}",
-                    "title": city_info['name'],
-                    "description": f"Image of {city_info['name']}",
-                    "source": "placeholder"
-                },
-                "description": f"{city_info['name']}, {city_info.get('country', 'a city')}",
-                "coordinates": None,
-                "has_details": False
-            }
-    
-    # Use ThreadPoolExecutor for parallel processing
-    with ThreadPoolExecutor(max_workers=min(config.MAX_WORKERS, len(filtered_cities[start_idx:end_idx]))) as executor:
-        cities_list = list(executor.map(process_city, filtered_cities[start_idx:end_idx]))
-    
-    logger.info(f"✅ Processed {len(cities_list)} cities")
-    
-    # Cache the results
-    cache.set(cache_key, cities_list, config.CACHE_TTL_PREVIEW)
+            future_to_city[future] = city_info
+        
+        for future in as_completed(future_to_city):
+            city_info = future_to_city[future]
+            try:
+                city_preview = future.result(timeout=10)
+                
+                # Create minimal response with only necessary data
+                minimal_response = {
+                    "id": city_preview["id"],
+                    "name": city_preview["name"],
+                    "display_name": city_preview["display_name"],
+                    "country": city_preview["country"],
+                    "region": city_preview["region"],
+                    "image": city_preview["image"], 
+                    "coordinates": city_preview["coordinates"],
+                    "summary": city_preview["summary"],
+                    "tagline": city_preview.get("tagline", ""),
+                    "has_details": True
+                }
+                
+                cities_list.append(minimal_response)
+                
+            except Exception as e:
+                logger.warning(f"Failed to load {city_info['name']}: {e}")
+                # Create fallback minimal response
+                cities_list.append({
+                    "id": city_info['name'].lower().replace(' ', '-'),
+                    "name": city_info['name'],
+                    "display_name": city_info['name'],
+                    "country": city_info.get('country'),
+                    "region": city_info.get('region'),
+                    "image": {
+                        "url": f"https://via.placeholder.com/400x300.png?text={quote_plus(city_info['name'])}",
+                        "title": city_info['name'],
+                        "description": f"Image of {city_info['name']}",
+                        "source": "placeholder"
+                    },
+                    "coordinates": None,
+                    "summary": f"{city_info['name']}, {city_info.get('country', 'a city')}",
+                    "tagline": f"Discover {city_info['name']}",
+                    "has_details": False
+                })
     
     return jsonify({
         "success": True,
@@ -1742,18 +2803,20 @@ def get_cities():
             "next_page": page + 1 if end_idx < total_cities else None,
             "prev_page": page - 1 if page > 1 else None
         },
-        "filtered_by": {"region": region, "country": country} if region or country else "all",
-        "cached": False
+        "mode": "minimal_preview"
     })
 
 @app.route('/api/cities/<path:city_name>')
-def get_city(city_name):
+def get_city_details(city_name):
     """
-    Individual city endpoint - loads full details only when requested
+    ENDPOINT 2: Returns FULL details for a specific city
+    - All images
+    - Full description
+    - Landmarks with their images
     """
     city_name = unquote(city_name)
     
-    # Find city
+    # Find city in WORLD_CITIES
     city_info = None
     for city in WORLD_CITIES:
         if city['name'].lower() == city_name.lower():
@@ -1767,15 +2830,32 @@ def get_city(city_name):
         }), 404
     
     try:
-        city_data = data_provider.get_city_details(
+        # Get full details with landmarks
+        city_details = data_provider.get_city_details_enhanced(
             city_info['name'],
             city_info.get('country'),
             city_info.get('region')
         )
         
+        # Fetch images for each landmark
+        landmarks_with_images = []
+        for landmark in city_details.get('landmarks', []):
+            landmark_name = landmark.get('name', '')
+            if landmark_name:
+                landmark_images = image_fetcher.get_landmark_images(landmark_name, city_info['name'])
+                landmark_with_images = {
+                    **landmark,
+                    "images": landmark_images[:3]  # Limit to 3 images per landmark
+                }
+                landmarks_with_images.append(landmark_with_images)
+        
+        # Update landmarks with images
+        city_details['landmarks'] = landmarks_with_images
+        
         return jsonify({
             "success": True,
-            "data": city_data
+            "data": city_details,
+            "mode": "full_details"
         })
         
     except Exception as e:
@@ -1785,10 +2865,181 @@ def get_city(city_name):
             "error": "Failed to fetch city details"
         }), 500
 
+@app.route('/api/cities/<path:city_name>/landmarks/<path:landmark_name>/images')
+def get_landmark_images(city_name, landmark_name):
+    """
+    ENDPOINT: Get images for a specific landmark in a city
+    - Uses Wikimedia API to fetch images based on landmark name
+    """
+    city_name = unquote(city_name)
+    landmark_name = unquote(landmark_name)
+    
+    try:
+        images = image_fetcher.get_landmark_images(landmark_name, city_name)
+        
+        return jsonify({
+            "success": True,
+            "data": {
+                "city": city_name,
+                "landmark": landmark_name,
+                "images": images,
+                "image_count": len(images)
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Failed to get landmark images for {landmark_name} in {city_name}: {e}")
+        return jsonify({
+            "success": False,
+            "error": "Failed to fetch landmark images"
+        }), 500
+
+@app.route('/api/morocco')
+def get_moroccan_cities():
+    """
+    ENDPOINT: Returns ONLY Moroccan cities
+    - Same minimal format as /api/cities
+    """
+    page = request.args.get('page', 1, type=int)
+    limit = request.args.get('limit', config.CITIES_PER_PAGE, type=int)
+    
+    limit = min(max(1, limit), config.CITIES_PER_PAGE)
+    page = max(1, page)
+    
+    total_cities = len(MOROCCAN_CITIES)
+    start_idx = (page - 1) * limit
+    end_idx = min(start_idx + limit, total_cities)
+    
+    cities_list = []
+    
+    # Use ThreadPoolExecutor for concurrent fetching
+    with ThreadPoolExecutor(max_workers=min(10, limit)) as executor:
+        future_to_city = {}
+        
+        for i in range(start_idx, end_idx):
+            city_info = MOROCCAN_CITIES[i]
+            future = executor.submit(
+                data_provider.get_city_preview_minimal,
+                city_info['name'],
+                city_info.get('country'),
+                city_info.get('region')
+            )
+            future_to_city[future] = city_info
+        
+        for future in as_completed(future_to_city):
+            city_info = future_to_city[future]
+            try:
+                city_preview = future.result(timeout=10)
+                
+                minimal_response = {
+                    "id": city_preview["id"],
+                    "name": city_preview["name"],
+                    "display_name": city_preview["display_name"],
+                    "country": city_preview["country"],
+                    "region": city_preview["region"],
+                    "image": city_preview["image"], 
+                    "coordinates": city_preview["coordinates"],
+                    "summary": city_preview["summary"],
+                    "tagline": city_preview.get("tagline", ""),
+                    "has_details": True
+                }
+                
+                cities_list.append(minimal_response)
+                
+            except Exception as e:
+                logger.warning(f"Failed to load Moroccan city {city_info['name']}: {e}")
+                cities_list.append({
+                    "id": city_info['name'].lower().replace(' ', '-'),
+                    "name": city_info['name'],
+                    "display_name": city_info['name'],
+                    "country": city_info.get('country'),
+                    "region": city_info.get('region'),
+                    "image": {
+                        "url": f"https://via.placeholder.com/400x300.png?text={quote_plus(city_info['name'])}",
+                        "title": city_info['name'],
+                        "description": f"Image of {city_info['name']}",
+                        "source": "placeholder"
+                    },
+                    "coordinates": None,
+                    "summary": f"{city_info['name']}, Morocco",
+                    "tagline": f"Discover {city_info['name']} in Morocco",
+                    "has_details": False
+                })
+    
+    return jsonify({
+        "success": True,
+        "data": cities_list,
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total_cities,
+            "pages": max(1, (total_cities + limit - 1) // limit),
+            "next_page": page + 1 if end_idx < total_cities else None,
+            "prev_page": page - 1 if page > 1 else None
+        },
+        "mode": "morocco_minimal_preview"
+    })
+
+@app.route('/api/morocco/<path:city_name>')
+def get_moroccan_city_details(city_name):
+    """
+    ENDPOINT: Returns FULL details for a specific Moroccan city
+    """
+    city_name = unquote(city_name)
+    
+    # Find city in MOROCCAN_CITIES
+    city_info = None
+    for city in MOROCCAN_CITIES:
+        if city['name'].lower() == city_name.lower():
+            city_info = city
+            break
+    
+    if not city_info:
+        return jsonify({
+            "success": False,
+            "error": f"Moroccan city '{city_name}' not found"
+        }), 404
+    
+    try:
+        # Get full details with landmarks
+        city_details = data_provider.get_city_details_enhanced(
+            city_info['name'],
+            city_info.get('country'),
+            city_info.get('region')
+        )
+        
+        # Fetch images for each landmark
+        landmarks_with_images = []
+        for landmark in city_details.get('landmarks', []):
+            landmark_name = landmark.get('name', '')
+            if landmark_name:
+                landmark_images = image_fetcher.get_landmark_images(landmark_name, city_info['name'])
+                landmark_with_images = {
+                    **landmark,
+                    "images": landmark_images[:3]
+                }
+                landmarks_with_images.append(landmark_with_images)
+        
+        # Update landmarks with images
+        city_details['landmarks'] = landmarks_with_images
+        city_details['country'] = 'Morocco'  # Ensure country is set to Morocco
+        
+        return jsonify({
+            "success": True,
+            "data": city_details,
+            "mode": "morocco_full_details"
+        })
+        
+    except Exception as e:
+        logger.error(f"Failed to get Moroccan city {city_name}: {e}")
+        return jsonify({
+            "success": False,
+            "error": "Failed to fetch Moroccan city details"
+        }), 500
+
 @app.route('/api/search')
 def search_cities():
-    """Fast search endpoint with caching"""
-    query = request.args.get('q', '').strip().lower()
+    query = request.args.get('q', '').strip()
     
     if len(query) < 2:
         return jsonify({
@@ -1797,55 +3048,76 @@ def search_cities():
         }), 400
     
     limit = request.args.get('limit', 20, type=int)
-    limit = min(max(1, limit), 100)
-    
-    # Check cache
-    cache_key = f"search:{query}:{limit}"
-    cached_results = cache.get(cache_key)
-    if cached_results:
-        return jsonify({
-            "success": True,
-            "query": query,
-            "count": len(cached_results),
-            "data": cached_results,
-            "cached": True
-        })
+    limit = min(max(1, limit), 50)
     
     results = []
     
-    # Simple linear search (optimized for 1000+ cities)
     for city in WORLD_CITIES:
-        if query in city['name'].lower():
+        if query.lower() in city['name'].lower():
             try:
-                city_data = data_provider.get_city_preview(
+                city_data = data_provider.get_city_preview_minimal(
                     city['name'],
                     city.get('country'),
                     city.get('region')
                 )
                 
-                results.append(city_data)
+                minimal_data = {
+                    "id": city_data["id"],
+                    "name": city_data["name"],
+                    "display_name": city_data["display_name"],
+                    "summary": city_data["summary"],
+                    "image": city_data["image"],
+                    "coordinates": city_data["coordinates"],
+                    "tagline": city_data.get("tagline", ""),
+                    "country": city_data["country"],
+                    "region": city_data["region"],
+                    "has_details": True
+                }
                 
-                if len(results) >= limit:
-                    break
+                results.append(minimal_data)
             except Exception:
-                continue
-    
-    # Cache search results
-    cache.set(cache_key, results, config.CACHE_TTL_PREVIEW)
+                pass
+            
+            if len(results) >= limit:
+                break
     
     return jsonify({
         "success": True,
         "query": query,
         "count": len(results),
         "data": results,
-        "cached": False
+        "data_type": "minimal_preview"
+    })
+
+@app.route('/api/stats')
+def get_stats():
+    cache_stats = cache.get_stats()
+    provider_stats = data_provider.get_stats()
+    request_stats = request_handler.get_performance_stats()
+    
+    return jsonify({
+        "statistics": {
+            "total_world_cities": len(WORLD_CITIES),
+            "total_moroccan_cities": len(MOROCCAN_CITIES),
+            "previews_generated": provider_stats.get('previews_generated', 0),
+            "details_generated": provider_stats.get('details_generated', 0),
+            "images_found": provider_stats.get('images_found', 0),
+        },
+        "cache": cache_stats,
+        "performance": request_stats,
+        "configuration": {
+            "cities_per_page": config.CITIES_PER_PAGE,
+            "cors_allowed_origins": config.ALLOWED_ORIGINS,
+            "max_images_per_request": config.MAX_IMAGES_PER_REQUEST
+        }
     })
 
 @app.errorhandler(404)
 def not_found(error):
     return jsonify({
         "success": False,
-        "error": "Endpoint not found"
+        "error": "Endpoint not found",
+        "allowed_origins": config.ALLOWED_ORIGINS
     }), 404
 
 @app.errorhandler(500)
@@ -1856,15 +3128,23 @@ def internal_error(error):
         "error": "Internal server error"
     }), 500
 
-# ==================== STARTUP ====================
+@app.before_request
+def check_origin():
+    """Middleware to check origin for security"""
+    origin = request.headers.get('Origin')
+    if origin and origin not in config.ALLOWED_ORIGINS:
+        logger.warning(f"Blocked request from unauthorized origin: {origin}")
+        return jsonify({
+            "success": False,
+            "error": "Unauthorized origin"
+        }), 403
+
 if __name__ == '__main__':
-    logger.info("🚀 Starting City Explorer API with OPTIMIZED CACHING")
-    logger.info(f"📊 Total cities: {len(WORLD_CITIES)}")
-    logger.info(f"📊 Unique regions: {len(REGIONS)}")
-    logger.info("✅ Region filtering enabled")
-    logger.info("✅ Smart caching enabled (memory, Redis, disk)")
-    logger.info("✅ Real Wikipedia images and descriptions")
-    logger.info("✅ Individual city details load on demand")
+    logger.info("🚀 Starting City Explorer API")
+    logger.info(f"📊 Total world cities: {len(WORLD_CITIES)}")
+    logger.info(f"📊 Total Moroccan cities: {len(MOROCCAN_CITIES)}")
+    logger.info(f"🔒 CORS restricted to: {config.ALLOWED_ORIGINS}")
+    logger.info(f"⚡ Loading {config.CITIES_PER_PAGE} cities per page")
     
     port = int(os.environ.get('PORT', 5000))
     
@@ -1874,7 +3154,3 @@ if __name__ == '__main__':
         debug=config.FLASK_DEBUG,
         threaded=True
     )
-else:
-    logger.info("🔧 Running in serverless mode with optimized caching")
-    logger.info(f"📊 Found {len(WORLD_CITIES)} cities")
-    logger.info(f"📊 Pre-built region/country indices for fast filtering")
