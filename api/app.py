@@ -1073,14 +1073,12 @@ class EnhancedCityDataProvider:
             "summary": "",  # Will be short description
             "has_details": False,
             "image": None,  # ONLY ONE image
-            "images": [],   # EMPTY - no images array
             "coordinates": None,
             "static_map": None,
             "tagline": None,
             "last_updated": time.time(),
             "country": country,
             "region": region,
-            "landmarks": [],  # EMPTY - no landmarks in preview
             "metadata": {
                 "data_type": "minimal_preview"
             }
@@ -1145,92 +1143,6 @@ class EnhancedCityDataProvider:
         
         logger.info(f"✅ Minimal preview generated for {city_name}")
         return preview
-    
-    def get_city_details_enhanced(self, city_name: str, country: str = None, 
-                                 region: str = None) -> Dict:
-        """FULL details for individual city page"""
-        cache_key = f"details:{city_name}:{country}:{region}"
-        
-        cached = cache.get(cache_key)
-        if cached:
-            self.stats['details_generated'] += 1
-            return cached
-        
-        self.stats['details_generated'] += 1
-        logger.info(f"🔄 Generating FULL details for {city_name}")
-        
-        # Start with minimal preview data
-        preview = self.get_city_preview_minimal(city_name, country, region)
-        
-        # Build full details
-        details = {
-            **preview,
-            "detailed_summary": "",
-            "sections": [],
-            "sources": [],
-            "map_config": {},
-            "additional_images": [],
-            "statistics": {},
-            "metadata": {
-                **preview.get("metadata", {}),
-                "data_type": "full_details",
-                "loaded_at": time.time()
-            }
-        }
-        
-        # Get full Wikipedia data
-        wiki_data, wiki_title = self.get_wikipedia_data_enhanced(city_name, country)
-        if wiki_data:
-            details["detailed_summary"] = wiki_data.get('summary', '')
-            details["sources"].append(wiki_data.get('fullurl', ''))
-            
-            # Include sections
-            sections_data = []
-            for section in wiki_data.get('sections', []):
-                if section.get('content'):
-                    sections_data.append({
-                        "title": section.get('title'),
-                        "content": section.get('content')
-                    })
-            details["sections"] = sections_data
-        
-        # Get additional images
-        try:
-            additional_images = image_fetcher.get_images_for_city(
-                city_name,
-                wiki_title or city_name,
-                limit=config.MAX_IMAGES_PER_REQUEST
-            )
-            
-            if additional_images:
-                # Update images array with all images
-                details["images"] = additional_images
-                # Keep first as main image
-                if additional_images and not details.get("image"):
-                    details["image"] = additional_images[0]
-                # Set additional_images to all but first
-                details["additional_images"] = additional_images[1:min(6, len(additional_images))]
-        except Exception as e:
-            logger.warning(f"Additional images failed for {city_name}: {e}")
-        
-        details["map_config"] = self.map_provider.get_map_config(
-            city_name,
-            details.get("coordinates")
-        )
-        
-        # Mark that details are loaded
-        details["has_details"] = True
-        
-        details["statistics"] = {
-            "image_count": len(details.get("images", [])),
-            "section_count": len(details.get("sections", [])),
-            "last_updated": time.time()
-        }
-        
-        cache.set(cache_key, details, config.CACHE_TTL)
-        
-        logger.info(f"✅ Details generated for {city_name}")
-        return details
     
     def _generate_city_id(self, city_name: str) -> str:
         city_id = city_name.lower().strip()
@@ -1343,50 +1255,6 @@ class MapProvider:
         except Exception:
             return False
 
-# ==================== CITY LOADING MANAGER ====================
-class CityLoadingManager:
-    def __init__(self, data_provider: EnhancedCityDataProvider):
-        self.data_provider = data_provider
-        self.loaded_cities = {}
-        self.loading_status = {
-            'total': 0,
-            'previews_loaded': 0,
-            'details_loaded': 0,
-            'failed': 0,
-            'start_time': None,
-        }
-        self.loading_queue = []
-        
-    def initialize_with_world_cities(self, world_cities_data: List[Dict]):
-        if not world_cities_data:
-            logger.error("❌ No world cities data provided!")
-            return
-        
-        self.loading_status['total'] = len(world_cities_data)
-        self.loading_status['start_time'] = time.time()
-        self.loading_status['previews_loaded'] = 0
-        self.loading_status['details_loaded'] = 0
-        self.loading_status['failed'] = 0
-        
-        self.loading_queue = []
-        for city_data in world_cities_data:
-            self.loading_queue.append({
-                'name': city_data['name'],
-                'country': city_data.get('country'),
-                'region': city_data.get('region'),
-                'priority': 50
-            })
-        
-        self.loading_queue.sort(key=lambda x: x['priority'], reverse=True)
-        
-        logger.info(f"📊 Initialized loading manager with {len(self.loading_queue)} cities")
-    
-    def get_loading_status(self):
-        return self.loading_status
-    
-    def get_city(self, city_name: str) -> Optional[Dict]:
-        return self.loaded_cities.get(city_name)
-
 # ==================== FLASK APP & ROUTES ====================
 app = Flask(__name__)
 
@@ -1399,8 +1267,39 @@ CORS(app,
 
 # Initialize providers
 data_provider = EnhancedCityDataProvider()
-map_provider = MapProvider()
-city_loader = CityLoadingManager(data_provider)
+
+# ==================== OPTIMIZED CITIES CACHE ====================
+class OptimizedCitiesCache:
+    def __init__(self):
+        self.region_cache = {}
+        self.all_cities_cache = None
+        self.last_updated = 0
+        self.cache_ttl = 300  # 5 minutes
+    
+    def get_all_cities(self):
+        """Get all cities - cached version"""
+        if self.all_cities_cache and (time.time() - self.last_updated) < self.cache_ttl:
+            return self.all_cities_cache
+        return None
+    
+    def set_all_cities(self, cities_data):
+        """Set cached cities"""
+        self.all_cities_cache = cities_data
+        self.last_updated = time.time()
+    
+    def get_region_cities(self, region):
+        """Get cities by region - cached version"""
+        if region in self.region_cache:
+            cached_data, timestamp = self.region_cache[region]
+            if (time.time() - timestamp) < self.cache_ttl:
+                return cached_data
+        return None
+    
+    def set_region_cities(self, region, cities_data):
+        """Set cached region cities"""
+        self.region_cache[region] = (cities_data, time.time())
+
+cities_cache = OptimizedCitiesCache()
 
 WORLD_CITIES = [
     # EUROPE (Expanded - 200+ cities)
@@ -2527,22 +2426,26 @@ def home():
         "version": "2.0.0",
         "status": "operational",
         "mode": "minimal-preview-mode",
-        "description": "/api/cities returns minimal data (name, 1 image, short description, coordinates, region). Full details on demand.",
+        "description": "/api/cities returns ONLY: name, region, description, and ONE image per city",
+        "features": [
+            "Loads all cities at once (no pagination)",
+            "Region filtering for faster loading",
+            "Optimized caching",
+            "Single representative image per city"
+        ],
         "endpoints": {
             "health": "/api/health",
-            "cities": "/api/cities (minimal preview only)",
+            "cities": "/api/cities?region=Europe (returns ALL cities or filtered by region)",
             "city_details": "/api/cities/<city_name> (full details)",
             "search": "/api/search",
             "stats": "/api/stats"
         },
-        "note": "WORLD_CITIES list is currently empty. Add city data to populate the API."
+        "total_cities": len(WORLD_CITIES)
     })
 
 @app.route('/api/health')
 def health():
-    loader_status = city_loader.get_loading_status()
     cache_stats = cache.get_stats()
-    request_stats = request_handler.get_performance_stats()
     provider_stats = data_provider.get_stats()
     
     return jsonify({
@@ -2550,66 +2453,47 @@ def health():
         "timestamp": datetime.utcnow().isoformat(),
         "mode": "minimal-preview",
         "world_cities_count": len(WORLD_CITIES),
-        "note": "WORLD_CITIES is empty. Add city data to enable city listings.",
-        "city_loading": loader_status,
         "cache": cache_stats,
-        "performance": request_stats,
         "provider_stats": provider_stats
     })
 
 @app.route('/api/cities')
 def get_cities():
     """
-    ENDPOINT 1: Returns ONLY name, 1 image, and small description for each city
+    ENDPOINT 1: Returns ONLY name, region, description, and ONE image for each city
+    - Loads ALL cities at once (no pagination)
+    - Supports region filtering for faster loading
+    - Optimized caching
     """
-    page = request.args.get('page', 1, type=int)
-    limit = request.args.get('limit', 30, type=int)
     region = request.args.get('region', type=str)
     country = request.args.get('country', type=str)
     
-    # Add debug logging
-    logger.info(f"📊 /api/cities called. WORLD_CITIES length: {len(WORLD_CITIES)}")
-    
-    if len(WORLD_CITIES) == 0:
-        logger.warning("⚠️ WORLD_CITIES is empty! No cities to display.")
+    # Check cache first
+    cache_key = f"all_cities:{region}:{country}"
+    cached_data = cache.get(cache_key)
+    if cached_data:
+        logger.info(f"📊 Cache hit for cities (region={region}, country={country})")
         return jsonify({
             "success": True,
-            "data": [],
-            "pagination": {
-                "limit": limit,
-                "next_page": None,
-                "page": page,
-                "pages": 1,
-                "prev_page": None,
-                "total": 0
-            },
-            "note": "WORLD_CITIES list is empty. Add city data to enable city listings.",
-            "mode": "minimal-preview"
+            "data": cached_data,
+            "total": len(cached_data),
+            "filtered_by": {"region": region, "country": country} if region or country else "all",
+            "cached": True
         })
     
-    page = max(1, page)
-    limit = min(max(1, limit), 100)
-    
-    # Filter cities
+    # Filter cities by region/country if specified
     filtered_cities = WORLD_CITIES
     if region:
         filtered_cities = [c for c in filtered_cities if c.get('region') == region]
     if country:
         filtered_cities = [c for c in filtered_cities if c.get('country') == country]
     
-    logger.info(f"📊 Filtered cities: {len(filtered_cities)}")
+    logger.info(f"📊 Loading {len(filtered_cities)} cities (region={region}, country={country})")
     
-    total_cities = len(filtered_cities)
-    start_idx = (page - 1) * limit
-    end_idx = min(start_idx + limit, total_cities)
-    
+    # Use ThreadPoolExecutor to load cities in parallel for faster loading
     cities_list = []
     
-    for i in range(start_idx, end_idx):
-        city_info = filtered_cities[i]
-        city_name = city_info['name']
-        
-        # Get the existing minimal preview
+    def load_city(city_info):
         try:
             city_preview = data_provider.get_city_preview_minimal(
                 city_info['name'],
@@ -2617,48 +2501,54 @@ def get_cities():
                 city_info.get('region')
             )
             
-            cities_list.append({
+            # Return ONLY the required fields
+            return {
                 "id": city_preview["id"],
                 "name": city_preview["name"],
                 "display_name": city_preview["display_name"],
                 "country": city_preview["country"],
                 "region": city_preview["region"],
-                "image": city_preview["image"], 
+                "image": city_preview["image"],  # ONE image only
+                "description": city_preview["summary"],  # Short description
                 "coordinates": city_preview["coordinates"],
-                "summary": city_preview["summary"],
-                "has_details": True 
-            })
-            
+                "has_details": True
+            }
         except Exception as e:
-            logger.warning(f"Failed to load {city_name}: {e}")
-            cities_list.append({
-                "id": city_name.lower().replace(' ', '-'),
-                "name": city_name,
-                "display_name": city_name,
+            logger.warning(f"Failed to load {city_info['name']}: {e}")
+            return {
+                "id": city_info['name'].lower().replace(' ', '-'),
+                "name": city_info['name'],
+                "display_name": city_info['name'],
                 "country": city_info.get('country'),
                 "region": city_info.get('region'),
                 "image": {
-                    "url": f"https://via.placeholder.com/400x300.png?text={quote_plus(city_name)}",
-                    "title": city_name,
-                    "description": f"Image of {city_name}",
+                    "url": f"https://via.placeholder.com/400x300.png?text={quote_plus(city_info['name'])}",
+                    "title": city_info['name'],
+                    "description": f"Image of {city_info['name']}",
                     "source": "placeholder"
                 },
+                "description": f"{city_info['name']}, {city_info.get('country', 'a city')}",
                 "coordinates": None,
-                "summary": f"{city_name}, {city_info.get('country', 'a city')}",
                 "has_details": False
-            })
+            }
+    
+    # Load all cities in parallel
+    with ThreadPoolExecutor(max_workers=min(10, len(filtered_cities))) as executor:
+        futures = [executor.submit(load_city, city_info) for city_info in filtered_cities]
+        for future in futures:
+            cities_list.append(future.result())
+    
+    logger.info(f"✅ Loaded {len(cities_list)} cities successfully")
+    
+    # Cache the results
+    cache.set(cache_key, cities_list, config.CACHE_TTL_PREVIEW)
     
     return jsonify({
         "success": True,
         "data": cities_list,
-        "pagination": {
-            "page": page,
-            "limit": limit,
-            "total": total_cities,
-            "pages": max(1, (total_cities + limit - 1) // limit),
-            "next_page": page + 1 if end_idx < total_cities else None,
-            "prev_page": page - 1 if page > 1 else None
-        }
+        "total": len(cities_list),
+        "filtered_by": {"region": region, "country": country} if region or country else "all",
+        "cached": False
     })
 
 @app.route('/api/cities/<path:city_name>')
@@ -2676,90 +2566,16 @@ def get_city(city_name):
             break
     
     if not city_info:
-        # Even if not in WORLD_CITIES, try to fetch data for any city name
-        logger.info(f"City '{city_name}' not in WORLD_CITIES list, attempting to fetch data anyway")
-        try:
-            # Get ALL images
-            all_images = image_fetcher.get_images_for_city(
-                city_name,
-                city_name,  # Use city name as page title
-                limit=config.MAX_IMAGES_PER_REQUEST
-            )
-            
-            # Get Wikipedia data for landmarks
-            wiki_data, wiki_title = data_provider.get_wikipedia_data_enhanced(
-                city_name,
-                None
-            )
-            
-            # Extract REAL landmarks from Wikipedia sections
-            landmarks = []
-            if wiki_data and wiki_data.get('sections'):
-                for section in wiki_data.get('sections', []):
-                    section_title = section.get('title', '').lower()
-                    section_content = section.get('content', '').lower()
-                    
-                    # Look for actual landmarks in content
-                    if any(keyword in section_title for keyword in ['landmarks', 'attractions', 'architecture', 'monuments', 'tourist']):
-                        # This section is about landmarks - extract specific ones
-                        lines = section_content.split('.')
-                        for line in lines:
-                            line = line.strip()
-                            if len(line) > 20 and any(word in line for word in [' is ', ' was ', ' built ', ' constructed ', ' located ', ' famous ', ' known ']):
-                                # Likely a landmark description
-                                landmarks.append(line[:100] + '...')
-            
-            # If no landmarks found in sections, use some from the summary
-            if not landmarks and wiki_data and wiki_data.get('summary'):
-                summary = wiki_data.get('summary', '')
-                # Look for famous things mentioned
-                sentences = summary.split('.')
-                for sentence in sentences[:5]:
-                    sentence = sentence.strip()
-                    if len(sentence) > 30 and any(word in sentence.lower() for word in ['famous', 'known', 'notable', 'major', 'popular']):
-                        landmarks.append(sentence[:150] + '...')
-            
-            # Get coordinates
-            coords_result = data_provider.get_coordinates_enhanced(
-                city_name,
-                None,
-                None
-            )
-            
-            coordinates = None
-            if coords_result:
-                lat, lon, _ = coords_result
-                coordinates = {"lat": lat, "lon": lon}
-            
-            return jsonify({
-                "success": True,
-                "data": {
-                    "id": city_name.lower().replace(' ', '-'),
-                    "name": city_name,
-                    "country": None,
-                    "region": None,
-                    "all_images": all_images,
-                    "image_count": len(all_images),
-                    "landmarks": landmarks[:10],
-                    "wiki_summary": wiki_data.get('summary', '') if wiki_data else "",
-                    "wiki_url": wiki_data.get('fullurl', '') if wiki_data else "",
-                    "coordinates": coordinates,
-                    "note": "City fetched dynamically (not in WORLD_CITIES list)"
-                }
-            })
-            
-        except Exception as e:
-            logger.error(f"Failed to fetch city {city_name} dynamically: {e}")
-            return jsonify({
-                "success": False,
-                "error": f"City '{city_name}' not found and could not be fetched dynamically"
-            }), 404
+        return jsonify({
+            "success": False,
+            "error": f"City '{city_name}' not found"
+        }), 404
     
     try:
         # Get ALL images
         all_images = image_fetcher.get_images_for_city(
             city_info['name'],
-            city_info.get('name'),  # Use city name as page title
+            city_info.get('name'),
             limit=config.MAX_IMAGES_PER_REQUEST
         )
         
@@ -2776,25 +2592,12 @@ def get_city(city_name):
                 section_title = section.get('title', '').lower()
                 section_content = section.get('content', '').lower()
                 
-                # Look for actual landmarks in content
                 if any(keyword in section_title for keyword in ['landmarks', 'attractions', 'architecture', 'monuments', 'tourist']):
-                    # This section is about landmarks - extract specific ones
                     lines = section_content.split('.')
                     for line in lines:
                         line = line.strip()
                         if len(line) > 20 and any(word in line for word in [' is ', ' was ', ' built ', ' constructed ', ' located ', ' famous ', ' known ']):
-                            # Likely a landmark description
                             landmarks.append(line[:100] + '...')
-        
-        # If no landmarks found in sections, use some from the summary
-        if not landmarks and wiki_data and wiki_data.get('summary'):
-            summary = wiki_data.get('summary', '')
-            # Look for famous things mentioned
-            sentences = summary.split('.')
-            for sentence in sentences[:5]:
-                sentence = sentence.strip()
-                if len(sentence) > 30 and any(word in sentence.lower() for word in ['famous', 'known', 'notable', 'major', 'popular']):
-                    landmarks.append(sentence[:150] + '...')
         
         # Get coordinates
         coords_result = data_provider.get_coordinates_enhanced(
@@ -2844,87 +2647,54 @@ def search_cities():
     limit = request.args.get('limit', 20, type=int)
     limit = min(max(1, limit), 50)
     
-    # Check if WORLD_CITIES is empty
-    if len(WORLD_CITIES) == 0:
-        return jsonify({
-            "success": True,
-            "query": query,
-            "count": 0,
-            "data": [],
-            "note": "WORLD_CITIES list is empty. Add city data to enable search.",
-            "data_type": "minimal_preview"
-        })
-    
     results = []
     
     for city in WORLD_CITIES:
         if query.lower() in city['name'].lower():
-            city_name = city['name']
-            
-            if city_name in city_loader.loaded_cities:
-                results.append(city_loader.loaded_cities[city_name])
-            else:
-                try:
-                    # Load minimal preview for search results
-                    city_data = data_provider.get_city_preview_minimal(
-                        city['name'],
-                        city.get('country'),
-                        city.get('region')
-                    )
-                    
-                    # Ensure minimal structure
-                    minimal_data = {
-                        "id": city_data["id"],
-                        "name": city_data["name"],
-                        "display_name": city_data["display_name"],
-                        "summary": city_data["summary"],
-                        "has_details": False,
-                        "image": city_data["image"],
-                        "images": [],  # EMPTY
-                        "coordinates": city_data["coordinates"],
-                        "static_map": city_data["static_map"],
-                        "tagline": city_data["tagline"],
-                        "last_updated": city_data["last_updated"],
-                        "country": city_data["country"],
-                        "region": city_data["region"],
-                        "landmarks": [],  # EMPTY
-                        "metadata": {
-                            "data_type": "minimal_preview"
-                        }
-                    }
-                    
-                    results.append(minimal_data)
-                except Exception:
-                    pass
-            
-            if len(results) >= limit:
-                break
+            try:
+                # Get minimal preview for search results
+                city_data = data_provider.get_city_preview_minimal(
+                    city['name'],
+                    city.get('country'),
+                    city.get('region')
+                )
+                
+                results.append({
+                    "id": city_data["id"],
+                    "name": city_data["name"],
+                    "display_name": city_data["display_name"],
+                    "description": city_data["summary"],
+                    "image": city_data["image"],
+                    "country": city_data["country"],
+                    "region": city_data["region"],
+                    "coordinates": city_data["coordinates"]
+                })
+                
+                if len(results) >= limit:
+                    break
+            except Exception:
+                continue
     
     return jsonify({
         "success": True,
         "query": query,
         "count": len(results),
-        "data": results,
-        "data_type": "minimal_preview"
+        "data": results
     })
 
 @app.route('/api/stats')
 def get_stats():
-    loader_status = city_loader.get_loading_status()
     cache_stats = cache.get_stats()
     provider_stats = data_provider.get_stats()
-    request_stats = request_handler.get_performance_stats()
     
     return jsonify({
         "city_statistics": {
             "total_cities_in_list": len(WORLD_CITIES),
-            "note": "WORLD_CITIES is empty. Add city data to enable city listings.",
-            "previews_loaded": loader_status.get('previews_loaded', 0),
-            "details_loaded": loader_status.get('details_loaded', 0),
+            "regions_available": list(set(city.get('region') for city in WORLD_CITIES if city.get('region'))),
+            "countries_available": list(set(city.get('country') for city in WORLD_CITIES if city.get('country'))),
         },
         "cache_statistics": cache_stats,
         "provider_statistics": provider_stats,
-        "performance": request_stats,
         "mode": "minimal_preview_for_listings"
     })
 
@@ -2945,12 +2715,10 @@ def internal_error(error):
 
 if __name__ == '__main__':
     logger.info("🚀 Starting City Explorer API with MINIMAL PREVIEW MODE")
-    
-    # Initialize with empty WORLD_CITIES
-    if WORLD_CITIES and len(WORLD_CITIES) > 0:
-        logger.info(f"📊 Total cities: {len(WORLD_CITIES)}")
-    else:
-        logger.info("ℹ️ WORLD_CITIES is empty. Add city data to enable city listings.")
+    logger.info(f"📊 Total cities: {len(WORLD_CITIES)}")
+    logger.info("✅ /api/cities now returns ONLY: name, region, description, and ONE image per city")
+    logger.info("✅ All cities loaded at once (no pagination)")
+    logger.info("✅ Region filtering enabled for faster loading")
     
     port = int(os.environ.get('PORT', 5000))
     
@@ -2962,8 +2730,4 @@ if __name__ == '__main__':
     )
 else:
     logger.info("🔧 Running in serverless mode with MINIMAL PREVIEW")
-    
-    if WORLD_CITIES and len(WORLD_CITIES) > 0:
-        logger.info(f"📊 Found {len(WORLD_CITIES)} cities")
-    else:
-        logger.info("ℹ️ WORLD_CITIES is empty. Add city data to enable city listings.")
+    logger.info(f"📊 Found {len(WORLD_CITIES)} cities")
