@@ -1955,7 +1955,6 @@ def server_error(error):
     }), 500
 
 # ==================== VERCEL ENTRY POINT ====================
-# This is important for Vercel serverless deployment
 def handler(event, context):
     """Vercel serverless handler"""
     return app(event, context)
