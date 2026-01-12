@@ -163,18 +163,19 @@ class ImageFetcher:
         self.wikimedia_api = "https://commons.wikimedia.org/w/api.php"
         self.wikipedia_api = "https://en.wikipedia.org/w/api.php"
     
-    def get_city_image(self, city_name: str) -> Dict:
+    def get_city_image(self, city_name: str, country: str = None) -> Dict:
         """Get one representative image for a city"""
-        cache_key = f"city_image:{city_name}"
+        cache_key = f"city_image:{city_name}:{country}"
         cached = cache.get(cache_key)
         if cached:
             return cached
         
         try:
             # Try Wikipedia first
+            search_query = f"{city_name}, {country}" if country else city_name
             params = {
                 'action': 'query',
-                'titles': city_name,
+                'titles': search_query,
                 'prop': 'pageimages',
                 'pithumbsize': 800,
                 'format': 'json'
@@ -254,8 +255,11 @@ class ImageFetcher:
     def _get_placeholder_image(self, city_name: str) -> Dict:
         """Generate a placeholder image URL"""
         encoded_name = quote_plus(city_name[:30])
+        colors = ['3388ff', 'ff5733', '33ff57', 'ff33a1', 'a133ff']
+        color = colors[hash(city_name) % len(colors)]
+        
         return {
-            'url': f'https://images.unsplash.com/photo-1519681393784-d120267933ba?ixlib=rb-4.0.3&auto=format&fit=crop&w=800&q=80&txt={encoded_name}&txt-size=40&txt-color=white',
+            'url': f'https://via.placeholder.com/800x600/{color}/ffffff?text={encoded_name}',
             'title': city_name,
             'description': f'Image of {city_name}',
             'source': 'placeholder',
@@ -278,20 +282,95 @@ class CityDataProvider:
             user_agent='CityExplorer/1.0'
         )
         self.common_coordinates = self._load_common_coordinates()
+        self.city_descriptions = self._load_city_descriptions()
     
     def _load_common_coordinates(self) -> Dict:
         """Pre-loaded coordinates for common cities"""
         return {
+            # Moroccan Cities
+            "Marrakech": {"lat": 31.6295, "lon": -7.9811},
+            "Casablanca": {"lat": 33.5731, "lon": -7.5898},
+            "Fez": {"lat": 34.0181, "lon": -5.0078},
+            "Tangier": {"lat": 35.7595, "lon": -5.8340},
+            "Rabat": {"lat": 34.0209, "lon": -6.8416},
+            "Agadir": {"lat": 30.4278, "lon": -9.5981},
+            "Meknes": {"lat": 33.8935, "lon": -5.5473},
+            "Oujda": {"lat": 34.6819, "lon": -1.9086},
+            "Kenitra": {"lat": 34.2541, "lon": -6.5890},
+            "Tetouan": {"lat": 35.5762, "lon": -5.3684},
+            "Safi": {"lat": 32.2833, "lon": -9.2333},
+            "El Jadida": {"lat": 33.2568, "lon": -8.5088},
+            "Nador": {"lat": 35.1686, "lon": -2.9333},
+            "Settat": {"lat": 33.0010, "lon": -7.6166},
+            "Beni Mellal": {"lat": 32.3373, "lon": -6.3498},
+            "Khourigba": {"lat": 32.8800, "lon": -6.9060},
+            "Al Hoceima": {"lat": 35.2510, "lon": -3.9373},
+            
+            # International Cities
             "Paris": {"lat": 48.8566, "lon": 2.3522},
             "London": {"lat": 51.5074, "lon": -0.1278},
             "New York": {"lat": 40.7128, "lon": -74.0060},
             "Tokyo": {"lat": 35.6762, "lon": 139.6503},
             "Dubai": {"lat": 25.2048, "lon": 55.2708},
-            "Marrakech": {"lat": 31.6295, "lon": -7.9811},
-            "Casablanca": {"lat": 33.5731, "lon": -7.5898},
             "Rome": {"lat": 41.9028, "lon": 12.4964},
             "Barcelona": {"lat": 41.3851, "lon": 2.1734},
             "Amsterdam": {"lat": 52.3676, "lon": 4.9041},
+        }
+    
+    def _load_city_descriptions(self) -> Dict:
+        """Pre-loaded descriptions for cities when Wikipedia is unavailable"""
+        return {
+            # Moroccan Cities with proper descriptions
+            "Marrakech": "About the city: Known as the 'Red City' for its distinctive red sandstone buildings, Marrakech is a vibrant cultural hub famous for its historic medina, bustling souks, and the iconic Jemaa el-Fnaa square.",
+            "Casablanca": "About the city: Morocco's largest city and economic capital, Casablanca is a modern metropolis famous for its stunning Hassan II Mosque, art deco architecture, and vibrant seaside corniche.",
+            "Fez": "About the city: The spiritual and cultural capital of Morocco, Fez is home to the world's oldest university and a UNESCO-listed medina that preserves centuries of Islamic architecture and traditional craftsmanship.",
+            "Tangier": "About the city: A historic port city straddling Africa and Europe, Tangier has long attracted artists and writers with its unique blend of Moroccan, European, and African influences.",
+            "Rabat": "About the city: Morocco's political and administrative capital, Rabat features historic sites like the Hassan Tower and Kasbah of the Udayas alongside modern government buildings.",
+            "Agadir": "About the city: A modern beach resort city on Morocco's southern Atlantic coast, Agadir is famous for its beautiful beaches, modern marina, and year-round sunshine.",
+            "Meknes": "About the city: Once the imperial capital of Morocco under Sultan Moulay Ismail, Meknes is known for its grand gates, extensive royal stables, and well-preserved historic monuments.",
+            "Essaouira": "About the city: A charming coastal town known for its fortified medina, fresh seafood, and strong winds that make it a paradise for windsurfers and kitesurfers.",
+            "Chefchaouen": "About the city: The famous 'Blue City' nestled in the Rif Mountains, Chefchaouen is renowned for its striking blue-washed buildings, relaxed atmosphere, and stunning mountain scenery.",
+            "Ouarzazate": "About the city: Known as the 'Door of the Desert', Ouarzazate serves as a gateway to the Sahara and is famous for its kasbahs and as a filming location for Hollywood movies.",
+            "Oujda": "About the city: The capital of eastern Morocco, Oujda is known for its Andalusian-influenced architecture and strategic location near the Algerian border.",
+            "Kenitra": "About the city: A major port city on the Sebou River, Kenitra is an important industrial and agricultural center with modern infrastructure.",
+            "Tetouan": "About the city: Known for its distinctive white architecture and strong Spanish influence, Tetouan features a UNESCO-listed medina with well-preserved Andalusian heritage.",
+            "Safi": "About the city: A historic port city famous for its pottery and ceramics, Safi has been a center for craftsmanship since the 11th century.",
+            "El Jadida": "About the city: A coastal city known for its Portuguese fortifications and the unique underground cistern, part of a UNESCO World Heritage site.",
+            "Nador": "About the city: A port city on the Mediterranean coast near the Spanish enclave of Melilla, known for its beautiful lagoon and beaches.",
+            "Settat": "About the city: An important agricultural and commercial center located between Casablanca and Marrakech.",
+            "Beni Mellal": "About the city: The economic capital of the Tadla-Azilal region, known for its fertile plains and the nearby Ain Asserdoun springs.",
+            "Khourigba": "About the city: The center of Morocco's phosphate mining industry, located in the phosphate plateau region.",
+            "Al Hoceima": "About the city: A picturesque Mediterranean port city in the Rif Mountains, known for its beautiful beaches and Spanish colonial architecture.",
+            "Larache": "About the city: A historic Atlantic port city with Spanish influences and important archaeological sites nearby.",
+            "Taza": "About the city: A strategic mountain city guarding the pass between the Rif and Middle Atlas mountains.",
+            "Errachidia": "About the city: The capital of the Draa-Tafilalet region, serving as gateway to the Sahara Desert and its stunning oases.",
+            "Taroudant": "About the city: Known as 'Little Marrakech', this walled city features impressive ramparts and a traditional souk atmosphere.",
+            "Ifrane": "About the city: A unique mountain resort town often called 'Little Switzerland' for its alpine architecture and clean streets.",
+            "Azrou": "About the city: A Berber town in the Middle Atlas known for its cedar forests, handicrafts, and weekly markets.",
+            "Midelt": "About the city: A market town in the Atlas Mountains known as the 'apple capital' of Morocco and gateway to the desert.",
+            "Guelmim": "About the city: Known as the 'Gateway to the Sahara', famous for its camel market and desert landscapes.",
+            "Dakhla": "About the city: A coastal city in Western Sahara known for its excellent kitesurfing conditions and oyster farming.",
+            "Laayoune": "About the city: The largest city in Western Sahara, known for its modern architecture and desert surroundings.",
+            
+            # International Cities
+            "Paris": "About the city: The romantic capital of France, famous for the Eiffel Tower, Louvre Museum, Notre-Dame Cathedral, and its world-renowned cuisine and fashion.",
+            "London": "About the city: A global financial hub with centuries of history, featuring iconic landmarks like Big Ben, the Tower of London, and Buckingham Palace.",
+            "New York": "About the city: The cultural and financial capital of the United States, known for Times Square, Central Park, Broadway, and the Statue of Liberty.",
+            "Tokyo": "About the city: A bustling metropolis blending ultramodern skyscrapers with historic temples, famous for its technology, cuisine, and pop culture.",
+            "Dubai": "About the city: A futuristic city in the United Arab Emirates known for luxury shopping, ultramodern architecture, and vibrant nightlife.",
+            "Rome": "About the city: The Eternal City, home to ancient ruins like the Colosseum and Roman Forum, as well as Vatican City and Renaissance art.",
+            "Barcelona": "About the city: A vibrant Spanish city famous for Gaudí's architecture, beautiful beaches, and the lively Las Ramblas boulevard.",
+            "Amsterdam": "About the city: The Dutch capital known for its elaborate canal system, historic houses, Van Gogh Museum, and vibrant cultural scene.",
+            "Madrid": "About the city: Spain's central capital known for its elegant boulevards, expansive parks, and rich collections of European art.",
+            "Berlin": "About the city: Germany's capital, known for its turbulent history, vibrant art scene, and landmarks like the Brandenburg Gate.",
+            "Istanbul": "About the city: A transcontinental city bridging Europe and Asia, famous for the Hagia Sophia, Blue Mosque, and Grand Bazaar.",
+            "Moscow": "About the city: Russia's cosmopolitan capital, home to the Kremlin, Red Square, and stunning onion-domed cathedrals.",
+            "Beijing": "About the city: China's ancient capital featuring the Forbidden City, Temple of Heaven, and the nearby Great Wall.",
+            "Cairo": "About the city: Egypt's sprawling capital, home to the Pyramids of Giza, Egyptian Museum, and historic Islamic Cairo.",
+            "Mumbai": "About the city: India's financial capital, a bustling metropolis known for Bollywood, colonial architecture, and vibrant street life.",
+            "Sydney": "About the city: Australia's iconic harbor city famous for the Sydney Opera House, Harbour Bridge, and beautiful beaches.",
+            "Rio de Janeiro": "About the city: Brazil's vibrant coastal city known for Copacabana Beach, Christ the Redeemer statue, and Carnival celebrations.",
+            "Cape Town": "About the city: South Africa's coastal capital known for Table Mountain, beautiful vineyards, and diverse cultural heritage.",
         }
     
     def get_city_preview(self, city_name: str, country: str = None, region: str = None) -> Dict:
@@ -311,13 +390,10 @@ class CityDataProvider:
             coordinates = self._get_coordinates(city_name, country)
         
         # Get image
-        image = image_fetcher.get_city_image(city_name)
+        image = image_fetcher.get_city_image(city_name, country)
         
-        # Generate summary
-        if country:
-            summary = f"{city_name} is a city in {country}"
-        else:
-            summary = f"Discover {city_name}"
+        # Get description - try Wikipedia first, then fallback
+        description = self._get_city_description(city_name, country)
         
         preview = {
             "id": city_id,
@@ -326,7 +402,7 @@ class CityDataProvider:
             "region": region,
             "coordinates": coordinates,
             "image": image,
-            "summary": summary,
+            "summary": description,
             "has_details": False
         }
         
@@ -347,10 +423,10 @@ class CityDataProvider:
         wiki_data = self._get_wikipedia_data(city_name, country)
         
         # Extract landmarks
-        landmarks = self._extract_landmarks(wiki_data)
+        landmarks = self._extract_landmarks(wiki_data, city_name)
         
         # Get more images
-        additional_images = self._get_additional_images(city_name)
+        additional_images = self._get_additional_images(city_name, country)
         
         # Build full details
         details = {
@@ -385,6 +461,41 @@ class CityDataProvider:
         
         return None
     
+    def _get_city_description(self, city_name: str, country: str = None) -> str:
+        """Get a good description for the city"""
+        # Try Wikipedia first for a short description
+        try:
+            page = self.wiki.page(city_name)
+            if not page.exists() and country:
+                page = self.wiki.page(f"{city_name}, {country}")
+            
+            if page.exists() and page.summary:
+                # Clean and shorten the summary
+                summary = page.summary
+                # Remove citation markers
+                summary = re.sub(r'\[\d+\]', '', summary)
+                # Get first 2-3 sentences
+                sentences = re.split(r'[.!?]', summary)
+                if len(sentences) > 1:
+                    description = sentences[0].strip()
+                    if len(sentences) > 1 and len(description) < 100:
+                        description += '. ' + sentences[1].strip()
+                    if not description.startswith('About the city:'):
+                        description = f"About the city: {description}"
+                    return description[:300] + '...' if len(description) > 300 else description
+        except:
+            pass
+        
+        # Fallback to pre-loaded descriptions
+        if city_name in self.city_descriptions:
+            return self.city_descriptions[city_name]
+        
+        # Generic fallback
+        if country:
+            return f"About the city: {city_name} is a significant city in {country}, known for its unique culture and historical importance."
+        else:
+            return f"About the city: {city_name} is known for its rich history, cultural heritage, and unique attractions."
+    
     def _get_wikipedia_data(self, city_name: str, country: str = None) -> Dict:
         """Get Wikipedia data for a city"""
         page = self.wiki.page(city_name)
@@ -393,40 +504,152 @@ class CityDataProvider:
         
         if page.exists():
             return {
-                'summary': page.summary[:500] + '...' if len(page.summary) > 500 else page.summary,
+                'summary': page.summary,
                 'url': page.fullurl
             }
         
         return {'summary': '', 'url': ''}
     
-    def _extract_landmarks(self, wiki_data: Dict) -> List[Dict]:
+    def _extract_landmarks(self, wiki_data: Dict, city_name: str) -> List[Dict]:
         """Extract landmarks from Wikipedia data"""
-        # Simplified landmark extraction
         landmarks = []
         summary = wiki_data.get('summary', '')
         
-        # Look for landmarks in summary
-        if 'famous' in summary.lower() or 'known for' in summary.lower():
-            # Extract sentences that might contain landmarks
-            sentences = summary.split('.')
-            for sentence in sentences[:5]:
-                if len(sentence.strip()) > 20:
-                    landmarks.append({
-                        "name": sentence.strip()[:50],
-                        "description": sentence.strip()[:200]
-                    })
+        # Moroccan cities have specific landmarks
+        moroccan_landmarks = {
+            "Marrakech": ["Jemaa el-Fnaa", "Bahia Palace", "Koutoubia Mosque", "Saadian Tombs", "Majorelle Garden"],
+            "Casablanca": ["Hassan II Mosque", "Old Medina", "Corniche", "Mohammed V Square", "Sacred Heart Cathedral"],
+            "Fez": ["Fes el Bali", "Al-Qarawiyyin University", "Bou Inania Madrasa", "Chouara Tannery", "Royal Palace"],
+            "Tangier": ["Kasbah Museum", "Caves of Hercules", "Grand Socco", "American Legation Museum", "Cap Spartel"],
+            "Rabat": ["Hassan Tower", "Kasbah of the Udayas", "Chellah", "Royal Palace", "Mohammed V Mausoleum"],
+            "Agadir": ["Agadir Beach", "Kasbah", "Valley of Birds", "Memorial Museum", "Marina"],
+            "Meknes": ["Bab Mansour", "Moulay Ismail Mausoleum", "Heri es-Souani", "Place el-Hedim", "Dar Jamai Museum"],
+            "Essaouira": ["Skala de la Ville", "Essaouira Medina", "Moulay Hassan Square", "Jewish Cemetery", "Port"],
+            "Chefchaouen": ["Outa el Hammam Square", "Grand Mosque", "Kasbah Museum", "Ras El Maa", "Spanish Mosque"],
+            "Ouarzazate": ["Taourirt Kasbah", "Atlas Film Studios", "Ait Benhaddou", "Fint Oasis", "Tifoultoute Kasbah"],
+        }
         
-        return landmarks[:5]  # Limit to 5 landmarks
+        # If we have pre-defined landmarks for this city, use them
+        if city_name in moroccan_landmarks:
+            for landmark in moroccan_landmarks[city_name]:
+                landmarks.append({
+                    "name": landmark,
+                    "description": f"One of the notable landmarks in {city_name}"
+                })
+            return landmarks[:5]
+        
+        # Generic landmark extraction from Wikipedia summary
+        if summary:
+            # Look for potential landmarks in the summary
+            sentences = summary.split('.')
+            for sentence in sentences[:8]:
+                sentence = sentence.strip()
+                if len(sentence) > 30 and any(keyword in sentence.lower() for keyword in 
+                                              ['famous', 'known for', 'notable', 'historic', 'landmark', 
+                                               'palace', 'mosque', 'museum', 'tower', 'square', 'garden']):
+                    # Extract potential landmark name
+                    words = sentence.split()
+                    for i, word in enumerate(words):
+                        if word.lower() in ['the', 'a', 'an'] and i+1 < len(words):
+                            landmark_name = words[i+1]
+                            if len(landmark_name) > 3 and landmark_name[0].isupper():
+                                landmarks.append({
+                                    "name": landmark_name,
+                                    "description": sentence[:150] + '...' if len(sentence) > 150 else sentence
+                                })
+                                break
+        
+        # If still no landmarks, add generic ones
+        if not landmarks:
+            generic_landmarks = ["Historic Center", "Main Square", "Local Museum", "Traditional Market", "City Park"]
+            for landmark in generic_landmarks[:3]:
+                landmarks.append({
+                    "name": f"{city_name} {landmark}",
+                    "description": f"A significant attraction in {city_name}"
+                })
+        
+        return landmarks[:5]
     
-    def _get_additional_images(self, city_name: str) -> List[Dict]:
+    def _get_additional_images(self, city_name: str, country: str = None) -> List[Dict]:
         """Get additional images for a city"""
-        # For now, just return empty list
-        # In production, you'd fetch more images here
+        # For now, return empty list - you can implement this later
         return []
 
 city_provider = CityDataProvider()
 
 # ==================== DATA ====================
+# Moroccan Cities (50+ cities)
+MOROCCAN_CITIES = [
+    {"name": "Marrakech", "country": "Morocco", "region": "Africa"},
+    {"name": "Casablanca", "country": "Morocco", "region": "Africa"},
+    {"name": "Fez", "country": "Morocco", "region": "Africa"},
+    {"name": "Tangier", "country": "Morocco", "region": "Africa"},
+    {"name": "Rabat", "country": "Morocco", "region": "Africa"},
+    {"name": "Agadir", "country": "Morocco", "region": "Africa"},
+    {"name": "Meknes", "country": "Morocco", "region": "Africa"},
+    {"name": "Oujda", "country": "Morocco", "region": "Africa"},
+    {"name": "Kenitra", "country": "Morocco", "region": "Africa"},
+    {"name": "Tetouan", "country": "Morocco", "region": "Africa"},
+    {"name": "Safi", "country": "Morocco", "region": "Africa"},
+    {"name": "El Jadida", "country": "Morocco", "region": "Africa"},
+    {"name": "Nador", "country": "Morocco", "region": "Africa"},
+    {"name": "Settat", "country": "Morocco", "region": "Africa"},
+    {"name": "Beni Mellal", "country": "Morocco", "region": "Africa"},
+    {"name": "Khourigba", "country": "Morocco", "region": "Africa"},
+    {"name": "Al Hoceima", "country": "Morocco", "region": "Africa"},
+    {"name": "Larache", "country": "Morocco", "region": "Africa"},
+    {"name": "Taza", "country": "Morocco", "region": "Africa"},
+    {"name": "Errachidia", "country": "Morocco", "region": "Africa"},
+    {"name": "Taroudant", "country": "Morocco", "region": "Africa"},
+    {"name": "Essaouira", "country": "Morocco", "region": "Africa"},
+    {"name": "Chefchaouen", "country": "Morocco", "region": "Africa"},
+    {"name": "Ouarzazate", "country": "Morocco", "region": "Africa"},
+    {"name": "Ifrane", "country": "Morocco", "region": "Africa"},
+    {"name": "Azrou", "country": "Morocco", "region": "Africa"},
+    {"name": "Midelt", "country": "Morocco", "region": "Africa"},
+    {"name": "Guelmim", "country": "Morocco", "region": "Africa"},
+    {"name": "Dakhla", "country": "Morocco", "region": "Africa"},
+    {"name": "Laayoune", "country": "Morocco", "region": "Africa"},
+    {"name": "Asilah", "country": "Morocco", "region": "Africa"},
+    {"name": "Sidi Ifni", "country": "Morocco", "region": "Africa"},
+    {"name": "Tiznit", "country": "Morocco", "region": "Africa"},
+    {"name": "Khenifra", "country": "Morocco", "region": "Africa"},
+    {"name": "Berkane", "country": "Morocco", "region": "Africa"},
+    {"name": "Taourirt", "country": "Morocco", "region": "Africa"},
+    {"name": "Figuig", "country": "Morocco", "region": "Africa"},
+    {"name": "Sidi Kacem", "country": "Morocco", "region": "Africa"},
+    {"name": "Skhirat", "country": "Morocco", "region": "Africa"},
+    {"name": "Temara", "country": "Morocco", "region": "Africa"},
+    {"name": "Mohammedia", "country": "Morocco", "region": "Africa"},
+    {"name": "El Kelaa des Sraghna", "country": "Morocco", "region": "Africa"},
+    {"name": "Ben Guerir", "country": "Morocco", "region": "Africa"},
+    {"name": "Tifelt", "country": "Morocco", "region": "Africa"},
+    {"name": "Lqliaa", "country": "Morocco", "region": "Africa"},
+    {"name": "M'diq", "country": "Morocco", "region": "Africa"},
+    {"name": "Fnideq", "country": "Morocco", "region": "Africa"},
+    {"name": "Martil", "country": "Morocco", "region": "Africa"},
+    {"name": "Bouznika", "country": "Morocco", "region": "Africa"},
+    {"name": "Berrechid", "country": "Morocco", "region": "Africa"},
+    {"name": "Sidi Bennour", "country": "Morocco", "region": "Africa"},
+    {"name": "Youssoufia", "country": "Morocco", "region": "Africa"},
+    {"name": "Lahraouyine", "country": "Morocco", "region": "Africa"},
+    {"name": "Jerada", "country": "Morocco", "region": "Africa"},
+    {"name": "Oulad Teima", "country": "Morocco", "region": "Africa"},
+    {"name": "Benslimane", "country": "Morocco", "region": "Africa"},
+    {"name": "Ait Melloul", "country": "Morocco", "region": "Africa"},
+    {"name": "Sidi Slimane", "country": "Morocco", "region": "Africa"},
+    {"name": "Souk El Arbaa", "country": "Morocco", "region": "Africa"},
+    {"name": "Tan-Tan", "country": "Morocco", "region": "Africa"},
+    {"name": "Ouezzane", "country": "Morocco", "region": "Africa"},
+    {"name": "Sefrou", "country": "Morocco", "region": "Africa"},
+    {"name": "Boulemane", "country": "Morocco", "region": "Africa"},
+    {"name": "Taounate", "country": "Morocco", "region": "Africa"},
+    {"name": "Goulmima", "country": "Morocco", "region": "Africa"},
+    {"name": "Midar", "country": "Morocco", "region": "Africa"},
+    {"name": "Zagora", "country": "Morocco", "region": "Africa"},
+    {"name": "Sidi Yahya Zaer", "country": "Morocco", "region": "Africa"},
+]
+
 WORLD_CITIES = [
     # EUROPE (Expanded - 200+ cities)
     {"name":"Paris","country":"France","region":"Europe"},
@@ -1543,9 +1766,6 @@ WORLD_CITIES = [
     {"name":"South Tarawa","country":"Kiribati","region":"Oceania"},
 ]
 
-REGIONS = set(["Europe", "North America", "Asia", "Oceania", "Middle East", "South America", "Africa"])
-MOROCCAN_CITIES = []  # Will be populated from WORLD_CITIES
-
 # ==================== FLASK APP ====================
 app = Flask(__name__)
 
@@ -1580,7 +1800,12 @@ def home():
             "city_details": "/api/cities/<city_name>",
             "morocco": "/api/morocco",
             "morocco_city": "/api/morocco/<city_name>",
-            "search": "/api/search"
+            "search": "/api/search",
+            "regions": "/api/regions"
+        },
+        "statistics": {
+            "total_cities": len(WORLD_CITIES),
+            "moroccan_cities": len(MOROCCAN_CITIES)
         }
     })
 
@@ -1589,8 +1814,31 @@ def health():
     return jsonify({
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
-        "cities_count": len(WORLD_CITIES),
-        "cache_enabled": True
+        "statistics": {
+            "total_cities": len(WORLD_CITIES),
+            "moroccan_cities": len(MOROCCAN_CITIES)
+        },
+        "cache_enabled": True,
+        "performance_mode": "optimized"
+    })
+
+@app.route('/api/regions')
+def get_regions():
+    """Get all available regions from city data"""
+    regions = sorted(set(city.get('region') for city in WORLD_CITIES if city.get('region')))
+    
+    # Count cities per region
+    region_counts = {}
+    for city in WORLD_CITIES:
+        region = city.get('region')
+        if region:
+            region_counts[region] = region_counts.get(region, 0) + 1
+    
+    return jsonify({
+        "success": True,
+        "regions": regions,
+        "counts": region_counts,
+        "total_regions": len(regions)
     })
 
 @app.route('/api/cities')
@@ -1645,15 +1893,19 @@ def get_cities():
                 cities_list.append(preview)
             except Exception as e:
                 logger.warning(f"Failed to load {city_info['name']}: {e}")
-                # Add fallback
+                # Add fallback with proper description
+                description = city_provider.city_descriptions.get(
+                    city_info['name'], 
+                    f"About the city: {city_info['name']} is a significant city in {city_info.get('country', 'its region')}."
+                )
                 cities_list.append({
                     "id": city_info['name'].lower().replace(' ', '-'),
                     "name": city_info['name'],
                     "country": city_info.get('country'),
                     "region": city_info.get('region'),
-                    "coordinates": None,
+                    "coordinates": city_provider.common_coordinates.get(city_info['name']),
                     "image": image_fetcher._get_placeholder_image(city_info['name']),
-                    "summary": f"{city_info['name']}, {city_info.get('country', '')}",
+                    "summary": description,
                     "has_details": False
                 })
     
@@ -1671,7 +1923,8 @@ def get_cities():
         },
         "cache_info": {
             "client_cache_ttl": 300,
-            "images_are_optimized": True
+            "images_are_optimized": True,
+            "descriptions_available": True
         }
     }
     
@@ -1687,7 +1940,7 @@ def get_city_details(city_name):
     city_name = unquote(city_name)
     
     # Check ETag for client cache
-    etag = hashlib.md5(city_name.encode()).hexdigest()
+    etag = hashlib.md5(f"city:{city_name}".encode()).hexdigest()
     if_none_match = request.headers.get('If-None-Match')
     if if_none_match == etag:
         return Response(status=304)
@@ -1764,10 +2017,6 @@ def get_landmark_images(city_name, landmark_name):
 @app.route('/api/morocco')
 def get_moroccan_cities():
     """Get only Moroccan cities"""
-    # Filter Moroccan cities
-    if not MOROCCAN_CITIES:
-        moroccan_cities = [c for c in WORLD_CITIES if c.get('country') == 'Morocco']
-    
     # Same logic as /api/cities but filtered
     page = max(1, int(request.args.get('page', 1)))
     limit = min(50, max(1, int(request.args.get('limit', config.CITIES_PER_PAGE))))
@@ -1779,10 +2028,10 @@ def get_moroccan_cities():
         response = jsonify(cached)
         return add_cache_headers(response, 300)
     
-    total = len(moroccan_cities)
+    total = len(MOROCCAN_CITIES)
     start = (page - 1) * limit
     end = start + limit
-    page_cities = moroccan_cities[start:end]
+    page_cities = MOROCCAN_CITIES[start:end]
     
     cities_list = []
     with ThreadPoolExecutor(max_workers=min(10, len(page_cities))) as executor:
@@ -1801,14 +2050,18 @@ def get_moroccan_cities():
                 preview = future.result(timeout=5)
                 cities_list.append(preview)
             except:
+                description = city_provider.city_descriptions.get(
+                    city_info['name'], 
+                    f"About the city: {city_info['name']} is one of Morocco's notable cities with rich cultural heritage."
+                )
                 cities_list.append({
                     "id": city_info['name'].lower().replace(' ', '-'),
                     "name": city_info['name'],
                     "country": "Morocco",
                     "region": city_info.get('region'),
-                    "coordinates": None,
+                    "coordinates": city_provider.common_coordinates.get(city_info['name']),
                     "image": image_fetcher._get_placeholder_image(city_info['name']),
-                    "summary": f"{city_info['name']}, Morocco",
+                    "summary": description,
                     "has_details": False
                 })
     
@@ -1822,6 +2075,11 @@ def get_moroccan_cities():
             "pages": max(1, (total + limit - 1) // limit),
             "next_page": page + 1 if end < total else None,
             "prev_page": page - 1 if page > 1 else None
+        },
+        "country_info": {
+            "name": "Morocco",
+            "total_cities": total,
+            "description": "Kingdom of Morocco - A North African country with diverse landscapes and rich history."
         }
     }
     
@@ -1837,8 +2095,8 @@ def get_moroccan_city_details(city_name):
     
     # Find Moroccan city
     city_info = None
-    for city in WORLD_CITIES:
-        if city.get('country') == 'Morocco' and city['name'].lower() == city_name.lower():
+    for city in MOROCCAN_CITIES:
+        if city['name'].lower() == city_name.lower():
             city_info = city
             break
     
@@ -1950,7 +2208,8 @@ def api_root():
             "/api/cities/[city_name]",
             "/api/morocco",
             "/api/morocco/[city_name]",
-            "/api/search?q=[query]"
+            "/api/search?q=[query]",
+            "/api/regions"
         ]
     })
 
@@ -1970,26 +2229,12 @@ def server_error(error):
         "error": "Internal server error"
     }), 500
 
-# ==================== INITIALIZATION ====================
-def initialize_data():
-    """Initialize city data"""
-    global WORLD_CITIES, MOROCCAN_CITIES
-    
-    # Your city data initialization will go here
-    # For now, using empty arrays
-    
-    # Filter Moroccan cities
-    MOROCCAN_CITIES = [c for c in WORLD_CITIES if c.get('country') == 'Morocco']
-    
-    logger.info(f"Initialized with {len(WORLD_CITIES)} world cities")
-    logger.info(f"Found {len(MOROCCAN_CITIES)} Moroccan cities")
-
-# Initialize on startup
-initialize_data()
-
 # ==================== MAIN ====================
 if __name__ == '__main__':
     logger.info("Starting City Explorer API")
+    logger.info(f"Total cities: {len(WORLD_CITIES)}")
+    logger.info(f"Moroccan cities: {len(MOROCCAN_CITIES)}")
+    
     app.run(
         host='0.0.0.0',
         port=int(os.environ.get('PORT', 5000)),

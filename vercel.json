@@ -1,14 +1,33 @@
 {
-  "builds": [
+  "functions": {
+    "api/index.py": {
+      "runtime": "python3.9",
+      "maxDuration": 30
+    }
+  },
+  "rewrites": [
     {
-      "src": "api/*.py",
-      "use": "@vercel/python"
+      "source": "/(.*)",
+      "destination": "/api/index.py"
     }
   ],
-  "routes": [
+  "headers": [
     {
-      "src": "/(.*)",
-      "dest": "/api/app.py"
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "Access-Control-Allow-Origin",
+          "value": "https://www.traveltto.com https://traveltto.vercel.app"
+        },
+        {
+          "key": "Access-Control-Allow-Methods",
+          "value": "GET, OPTIONS"
+        },
+        {
+          "key": "Access-Control-Allow-Headers",
+          "value": "Content-Type, Authorization, If-None-Match"
+        }
+      ]
     }
   ]
 }
