@@ -1903,6 +1903,9 @@ WORLD_CITIES = [
     {"name":"South Tarawa","country":"Kiribati","region":"Oceania"},
 ]
 
+# Separate Moroccan cities for the /api/morocco endpoint
+MOROCCO_CITIES = [city for city in WORLD_CITIES if city["country"] == "Morocco"]
+
 # ==================== BATCH DATA PROCESSOR WITH CACHE ====================
 class BatchDataProcessor:
     """Process multiple cities in parallel batches with cache optimization"""
@@ -1965,14 +1968,6 @@ class BatchDataProcessor:
                 results.append(cached_data[city['name']])
         
         return results
-    
-    @staticmethod
-    def stream_cities_data(cities: List[Dict], batch_size: int = 50):
-        """Stream cities data in batches"""
-        for i in range(0, len(cities), batch_size):
-            batch = cities[i:i + batch_size]
-            processed_batch = BatchDataProcessor.process_cities_batch(batch)
-            yield processed_batch
 
 # ==================== FLASK APP WITH CACHE OPTIMIZED ROUTES ====================
 app = Flask(__name__)
@@ -2043,30 +2038,6 @@ def cache_warmup():
             "error": f"Cache warmup failed: {str(e)}"
         }), 500
 
-@app.route('/api/cache/clear', methods=['POST'])
-def clear_cache():
-    """Clear cache (admin only)"""
-    origin_check = check_origin()
-    if origin_check:
-        return origin_check
-    
-    try:
-        cache.clear_memory_cache()
-        # Note: Redis cache is not cleared automatically for persistence
-        
-        return jsonify({
-            "success": True,
-            "message": "Memory cache cleared",
-            "memory_cache_size": len(cache.memory_cache)
-        })
-        
-    except Exception as e:
-        logger.error(f"Cache clear failed: {e}")
-        return jsonify({
-            "success": False,
-            "error": f"Cache clear failed: {str(e)}"
-        }), 500
-
 # ==================== OPTIMIZED ROUTES WITH CACHE ====================
 @app.before_request
 def before_request():
@@ -2083,13 +2054,16 @@ def home():
         "name": "City Explorer API v3.0 with Redis Cache",
         "version": "3.0",
         "status": "operational",
-        "features": ["redis-cache", "batch-processing", "streaming", "parallel-fetching"],
+        "features": ["redis-cache", "batch-processing", "streaming", "parallel-fetching", "morocco-endpoints"],
         "total_cities": len(WORLD_CITIES),
+        "total_morocco_cities": len(MOROCCO_CITIES),
         "cache_enabled": config.USE_REDIS,
         "endpoints": {
             "cities_list": "/api/cities (cached)",
             "cities_all": "/api/cities/all (streaming available)",
             "city_details": "/api/cities/<city_name> (partially cached)",
+            "morocco_cities": "/api/morocco (cached)",
+            "morocco_city": "/api/morocco/<city_name> (cached)",
             "search": "/api/search?q=<query> (cached)",
             "cache_stats": "/api/cache/stats",
             "cache_warmup": "/api/cache/warmup (POST)",
@@ -2104,6 +2078,7 @@ def health():
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
         "total_cities": len(WORLD_CITIES),
+        "total_morocco_cities": len(MOROCCO_CITIES),
         "cache_stats": cache.get_stats(),
         "mode": "redis-cache-enabled"
     })
@@ -2112,6 +2087,7 @@ def health():
 def stats():
     return jsonify({
         "cities_total": len(WORLD_CITIES),
+        "morocco_cities_total": len(MOROCCO_CITIES),
         "regions": list(set(city["region"] for city in WORLD_CITIES)),
         "countries": list(set(city["country"] for city in WORLD_CITIES)),
         "cache_status": "active",
@@ -2119,6 +2095,148 @@ def stats():
         "performance_mode": "cache-optimized"
     })
 
+# ==================== RESTORED MOROCCO ENDPOINTS ====================
+@app.route('/api/morocco')
+def get_morocco_cities():
+    """
+    Get paginated list of Moroccan cities only with cache optimization
+    """
+    origin_check = check_origin()
+    if origin_check:
+        return origin_check
+    
+    page = request.args.get('page', 1, type=int)
+    limit = min(request.args.get('limit', 50, type=int), 100)
+    
+    # Create cache key for Morocco cities list
+    cache_key = f"morocco_cities:page:{page}:limit:{limit}"
+    cached_result = cache.get(cache_key)
+    
+    if cached_result:
+        logger.info(f"Cache hit for Morocco cities list: {cache_key}")
+        return jsonify(cached_result)
+    
+    total_cities = len(MOROCCO_CITIES)
+    start_idx = (page - 1) * limit
+    end_idx = min(start_idx + limit, total_cities)
+    
+    # Get the current batch
+    current_batch = MOROCCO_CITIES[start_idx:end_idx]
+    
+    # Process batch with cache optimization
+    cities_list = BatchDataProcessor.process_cities_batch(current_batch)
+    
+    response = {
+        "success": True,
+        "country": "Morocco",
+        "data": cities_list,
+        "pagination": {
+            "page": page,
+            "limit": limit,
+            "total": total_cities,
+            "pages": max(1, (total_cities + limit - 1) // limit),
+            "next_page": page + 1 if end_idx < total_cities else None,
+            "prev_page": page - 1 if page > 1 else None
+        },
+        "performance": {
+            "batch_size": len(current_batch),
+            "processing": "cache-optimized"
+        }
+    }
+    
+    # Cache the response for 5 minutes for paginated results
+    cache.set(cache_key, response, ttl=300)  # 5 minutes
+    
+    return jsonify(response)
+
+@app.route('/api/morocco/<path:city_name>')
+def get_morocco_city_details(city_name):
+    """
+    Get full details for a specific Moroccan city with cache optimization
+    """
+    origin_check = check_origin()
+    if origin_check:
+        return origin_check
+    
+    city_name = unquote(city_name)
+    
+    # Check cache first
+    cache_key = f"morocco_city_details:{city_name}"
+    cached_details = cache.get(cache_key)
+    
+    if cached_details:
+        logger.info(f"Cache hit for Morocco city details: {city_name}")
+        return jsonify(cached_details)
+    
+    # Find city in MOROCCO_CITIES
+    city_info = None
+    for city in MOROCCO_CITIES:
+        if city['name'].lower() == city_name.lower():
+            city_info = city
+            break
+    
+    if not city_info:
+        return jsonify({
+            "success": False,
+            "error": f"Moroccan city '{city_name}' not found in database"
+        }), 404
+    
+    try:
+        # Use ThreadPoolExecutor for parallel fetching
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            # Try with "city_name, Morocco" first for better results
+            search_name = f"{city_name}, Morocco"
+            future_summary = executor.submit(wikipedia_provider.get_city_summary, search_name)
+            future_coords = executor.submit(coordinates_provider.get_coordinates, city_name, "Morocco")
+            future_images = executor.submit(image_fetcher.get_images_for_city, search_name, 20)
+            future_landmarks = executor.submit(wikipedia_provider.extract_landmarks, search_name)
+            
+            # Get results
+            summary, wiki_title = future_summary.result(timeout=15)
+            coordinates = future_coords.result(timeout=10)
+            city_images = future_images.result(timeout=15)
+            landmarks = future_landmarks.result(timeout=15)
+        
+        # If no results with "city_name, Morocco", try just city_name
+        if not summary and not city_images:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                future_summary2 = executor.submit(wikipedia_provider.get_city_summary, city_name)
+                future_images2 = executor.submit(image_fetcher.get_images_for_city, city_name, 20)
+                
+                summary, wiki_title = future_summary2.result(timeout=10)
+                if not city_images:
+                    city_images = future_images2.result(timeout=10)
+        
+        response = {
+            "success": True,
+            "data": {
+                "name": city_name,
+                "country": "Morocco",
+                "region": city_info.get('region'),
+                "wiki_title": wiki_title,
+                "summary": summary or f"Information about {city_name}, Morocco",
+                "coordinates": coordinates,
+                "images": city_images,
+                "image_count": len(city_images),
+                "landmarks": landmarks or [],
+                "landmark_count": len(landmarks) if landmarks else 0,
+                "fetched_at": datetime.utcnow().isoformat()
+            }
+        }
+        
+        # Cache Morocco city details for 1 hour
+        cache.set(cache_key, response, ttl=3600)
+        
+        return jsonify(response)
+        
+    except Exception as e:
+        logger.error(f"Failed to fetch Moroccan city details for {city_name}: {e}")
+        return jsonify({
+            "success": False,
+            "error": f"Failed to fetch details for {city_name}, Morocco"
+        }), 500
+
+# ==================== REST OF THE ENDPOINTS ====================
 @app.route('/api/cities')
 def get_cities():
     """
@@ -2342,6 +2460,7 @@ if __name__ == '__main__':
     logger.info("🚀 Starting City Explorer API with Redis Cache")
     logger.info(f"✅ Allowed origins: {ALLOWED_ORIGINS}")
     logger.info(f"📊 Total cities: {len(WORLD_CITIES)}")
+    logger.info(f"📊 Moroccan cities: {len(MOROCCO_CITIES)}")
     logger.info(f"⚡ Redis enabled: {config.USE_REDIS}")
     logger.info(f"💾 Cache TTL: {config.CACHE_TTL} seconds")
     
@@ -2357,4 +2476,5 @@ else:
     logger.info("🔧 Running in serverless mode with Redis cache")
     logger.info(f"✅ Allowed origins: {ALLOWED_ORIGINS}")
     logger.info(f"📊 Total cities: {len(WORLD_CITIES)}")
+    logger.info(f"📊 Moroccan cities: {len(MOROCCO_CITIES)}")
     logger.info(f"⚡ Cache mode: Redis + Memory hybrid")
