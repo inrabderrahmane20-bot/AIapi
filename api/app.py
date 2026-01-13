@@ -5,6 +5,7 @@ import time
 import logging
 import hashlib
 import redis
+import cached_endpoint
 from typing import List, Dict, Optional, Tuple, Any, Union
 from functools import wraps
 from datetime import datetime
@@ -1982,6 +1983,7 @@ CORS(app,
 
 # ==================== NEW CACHE MANAGEMENT ROUTES ====================
 @app.route('/api/cache/stats')
+@cached_endpoint(prefix="cache_stats")
 def cache_stats():
     """Get cache statistics"""
     origin_check = check_origin()
@@ -2001,6 +2003,7 @@ def cache_stats():
     })
 
 @app.route('/api/cache/warmup', methods=['POST'])
+@cached_endpoint(prefix="cache_warmup", expire=300)
 def cache_warmup():
     """Warm up cache with popular cities"""
     origin_check = check_origin()
@@ -2097,6 +2100,7 @@ def stats():
 
 # ==================== RESTORED MOROCCO ENDPOINTS ====================
 @app.route('/api/morocco')
+@cached_endpoint(prefix="morocco_cities")
 def get_morocco_cities():
     """
     Get paginated list of Moroccan cities only with cache optimization
@@ -2150,6 +2154,7 @@ def get_morocco_cities():
     return jsonify(response)
 
 @app.route('/api/morocco/<path:city_name>')
+@cached_endpoint(prefix="morocco_city_details")
 def get_morocco_city_details(city_name):
     """
     Get full details for a specific Moroccan city with cache optimization
@@ -2238,6 +2243,7 @@ def get_morocco_city_details(city_name):
 
 # ==================== REST OF THE ENDPOINTS ====================
 @app.route('/api/cities')
+@cached_endpoint(prefix="cities")
 def get_cities():
     """
     Get paginated list of cities with cache optimization
@@ -2299,6 +2305,7 @@ def get_cities():
     return jsonify(response)
 
 @app.route('/api/cities/<path:city_name>')
+@cached_endpoint(prefix="city_details")
 def get_city_details(city_name):
     """
     Get full details for a specific city with cache optimization
@@ -2375,6 +2382,7 @@ def get_city_details(city_name):
         }), 500
 
 @app.route('/api/search')
+@cached_endpoint(prefix="city_search")
 def search_cities():
     """
     Search for cities with cache optimization
