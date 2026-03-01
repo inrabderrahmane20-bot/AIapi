@@ -17,6 +17,7 @@ from flask_cors import CORS
 from dataclasses import dataclass, field
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import backoff
+import concurrent.futures
 
 # ==================== CONFIGURATION ====================
 @dataclass
@@ -562,6 +563,66 @@ class CoordinatesProvider:
         return None
 
 coordinates_provider = CoordinatesProvider()
+
+# ==================== DATA FETCHING HELPERS ====================
+def fetch_single_city_data(city_info: dict, requested_fields: List[str] = None) -> dict:
+    """Fetch data for a single city with optional field filtering"""
+    city_name = city_info['name']
+    
+    # Default behavior: fetch everything if no fields specified
+    fetch_all = requested_fields is None or len(requested_fields) == 0
+    
+    # Determine what to fetch based on requested fields
+    should_fetch_summary = fetch_all or 'summary' in requested_fields
+    should_fetch_image = fetch_all or 'image' in requested_fields
+    should_fetch_coords = fetch_all or 'coordinates' in requested_fields or 'location' in requested_fields
+    
+    result = {
+        "id": city_name.lower().replace(' ', '-'),
+        "name": city_name,
+        "country": city_info.get('country'),
+        "region": city_info.get('region'),
+        "has_details": True
+    }
+    
+    try:
+        # 1. Get summary (Wikipedia)
+        if should_fetch_summary:
+            summary, _ = wikipedia_provider.get_city_summary(city_name)
+            result["summary"] = summary or f"{city_name}, {city_info.get('country', 'a city')}"
+            
+        # 2. Get image (Wikimedia)
+        if should_fetch_image:
+            image = image_fetcher.get_one_representative_image(city_name)
+            result["image"] = image
+            
+        # 3. Get coordinates (Nominatim)
+        if should_fetch_coords:
+            coordinates = coordinates_provider.get_coordinates(city_name, city_info.get('country'))
+            result["coordinates"] = coordinates
+            
+    except Exception as e:
+        logger.warning(f"Failed to load data for {city_name}: {e}")
+        # If critical failure, mark has_details as False but still return basic info
+        result["has_details"] = False
+        if should_fetch_summary and "summary" not in result:
+             result["summary"] = f"{city_name}, {city_info.get('country', 'a city')}"
+    
+    return result
+
+def fetch_cities_parallel(cities: List[dict], requested_fields: List[str] = None, max_workers: int = 20) -> List[dict]:
+    """Fetch data for multiple cities in parallel"""
+    if not cities:
+        return []
+        
+    logger.info(f"Fetching data for {len(cities)} cities in parallel (fields={requested_fields})")
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Using map ensures results are returned in the same order as input
+        results = list(executor.map(lambda c: fetch_single_city_data(c, requested_fields), cities))
+        
+    return results
+
 
 # ==================== YOUR CITY DATA ====================
 WORLD_CITIES = [
@@ -1686,6 +1747,32 @@ MOROCCO_CITIES = [city for city in WORLD_CITIES if city["country"] == "Morocco"]
 # Region list
 REGIONS = set(["Europe", "North America", "Asia", "Oceania", "Middle East", "South America", "Africa"])
 
+def interleave_cities_by_region(cities):
+    """
+    Interleave cities by region to show diversity in the initial list.
+    Takes 1st city of each region, then 2nd of each, etc.
+    """
+    from collections import defaultdict
+    regions = defaultdict(list)
+    for city in cities:
+        regions[city.get('region', 'Other')].append(city)
+    
+    # Sort regions alphabetically to be deterministic
+    region_names = sorted(regions.keys())
+    
+    max_count = max(len(c) for c in regions.values()) if regions else 0
+    interleaved = []
+    
+    for i in range(max_count):
+        for region in region_names:
+            if i < len(regions[region]):
+                interleaved.append(regions[region][i])
+                
+    return interleaved
+
+# Create interleaved version for default view
+INTERLEAVED_WORLD_CITIES = interleave_cities_by_region(WORLD_CITIES)
+
 # ==================== FLASK APP ====================
 app = Flask(__name__)
 
@@ -1751,53 +1838,32 @@ def get_cities():
     limit = request.args.get('limit', 50, type=int)  # Fixed to 50 per page
     region = request.args.get('region', type=str)
     country = request.args.get('country', type=str)
+    fields_param = request.args.get('fields', type=str)
+    
+    requested_fields = None
+    if fields_param:
+        requested_fields = [f.strip().lower() for f in fields_param.split(',')]
     
     # Filter cities
-    filtered_cities = WORLD_CITIES
-    if region:
-        filtered_cities = [c for c in filtered_cities if c.get('region') == region]
-    if country:
-        filtered_cities = [c for c in filtered_cities if c.get('country') == country]
+    # If no filters, use interleaved list for better region distribution
+    if not region and not country:
+        filtered_cities = INTERLEAVED_WORLD_CITIES
+    else:
+        filtered_cities = WORLD_CITIES
+        if region:
+            filtered_cities = [c for c in filtered_cities if c.get('region') == region]
+        if country:
+            filtered_cities = [c for c in filtered_cities if c.get('country') == country]
     
     total_cities = len(filtered_cities)
     start_idx = (page - 1) * limit
     end_idx = min(start_idx + limit, total_cities)
     
-    cities_list = []
+    # Slice the list for the current page
+    cities_page = filtered_cities[start_idx:end_idx]
     
-    for i in range(start_idx, end_idx):
-        city_info = filtered_cities[i]
-        city_name = city_info['name']
-        
-        try:
-            # Get minimal data for list view
-            summary, _ = wikipedia_provider.get_city_summary(city_name)
-            image = image_fetcher.get_one_representative_image(city_name)
-            coordinates = coordinates_provider.get_coordinates(city_name, city_info.get('country'))
-            
-            cities_list.append({
-                "id": city_name.lower().replace(' ', '-'),
-                "name": city_name,
-                "country": city_info.get('country'),
-                "region": city_info.get('region'),
-                "summary": summary or f"{city_name}, {city_info.get('country', 'a city')}",
-                "image": image,
-                "coordinates": coordinates,
-                "has_details": True
-            })
-            
-        except Exception as e:
-            logger.warning(f"Failed to load minimal data for {city_name}: {e}")
-            cities_list.append({
-                "id": city_name.lower().replace(' ', '-'),
-                "name": city_name,
-                "country": city_info.get('country'),
-                "region": city_info.get('region'),
-                "summary": f"{city_name}, {city_info.get('country', 'a city')}",
-                "image": None,
-                "coordinates": None,
-                "has_details": False
-            })
+    # Fetch data in parallel
+    cities_list = fetch_cities_parallel(cities_page, requested_fields)
     
     return jsonify({
         "success": True,
@@ -1817,6 +1883,7 @@ def get_city_details(city_name):
     """
     Get full details for a specific city
     Fetches: All images, landmarks with their own images, coordinates, etc.
+    Supports field filtering via ?fields=name,images,summary
     """
     # Check origin
     origin_check = check_origin()
@@ -1824,6 +1891,11 @@ def get_city_details(city_name):
         return origin_check
     
     city_name = unquote(city_name)
+    fields_param = request.args.get('fields', type=str)
+    
+    requested_fields = None
+    if fields_param:
+        requested_fields = [f.strip().lower() for f in fields_param.split(',')]
     
     # Find city in WORLD_CITIES
     city_info = None
@@ -1839,33 +1911,47 @@ def get_city_details(city_name):
         }), 404
     
     try:
+        # Determine what to fetch based on requested fields
+        fetch_all = requested_fields is None or len(requested_fields) == 0
+        
+        should_fetch_summary = fetch_all or 'summary' in requested_fields or 'wiki_title' in requested_fields
+        should_fetch_coords = fetch_all or 'coordinates' in requested_fields or 'location' in requested_fields
+        should_fetch_images = fetch_all or 'images' in requested_fields
+        should_fetch_landmarks = fetch_all or 'landmarks' in requested_fields
+        
+        result_data = {
+            "name": city_name,
+            "country": city_info.get('country'),
+            "region": city_info.get('region'),
+            "fetched_at": datetime.utcnow().isoformat()
+        }
+        
         # Get detailed info
-        summary, wiki_title = wikipedia_provider.get_city_summary(city_name)
+        if should_fetch_summary:
+            summary, wiki_title = wikipedia_provider.get_city_summary(city_name)
+            result_data["summary"] = summary or f"Information about {city_name}"
+            result_data["wiki_title"] = wiki_title
         
         # Get coordinates
-        coordinates = coordinates_provider.get_coordinates(city_name, city_info.get('country'))
+        if should_fetch_coords:
+            coordinates = coordinates_provider.get_coordinates(city_name, city_info.get('country'))
+            result_data["coordinates"] = coordinates
         
         # Get multiple images for the city
-        city_images = image_fetcher.get_images_for_city(city_name, limit=20)
+        if should_fetch_images:
+            city_images = image_fetcher.get_images_for_city(city_name, limit=20)
+            result_data["images"] = city_images
+            result_data["image_count"] = len(city_images)
         
         # Get landmarks with their own images
-        landmarks = wikipedia_provider.extract_landmarks(city_name)
+        if should_fetch_landmarks:
+            landmarks = wikipedia_provider.extract_landmarks(city_name)
+            result_data["landmarks"] = landmarks
+            result_data["landmark_count"] = len(landmarks)
         
         return jsonify({
             "success": True,
-            "data": {
-                "name": city_name,
-                "country": city_info.get('country'),
-                "region": city_info.get('region'),
-                "wiki_title": wiki_title,
-                "summary": summary or f"Information about {city_name}",
-                "coordinates": coordinates,
-                "images": city_images,
-                "image_count": len(city_images),
-                "landmarks": landmarks,
-                "landmark_count": len(landmarks),
-                "fetched_at": datetime.utcnow().isoformat()
-            }
+            "data": result_data
         })
         
     except Exception as e:
@@ -1887,46 +1973,21 @@ def get_morocco_cities():
     
     page = request.args.get('page', 1, type=int)
     limit = request.args.get('limit', 50, type=int)
+    fields_param = request.args.get('fields', type=str)
+    
+    requested_fields = None
+    if fields_param:
+        requested_fields = [f.strip().lower() for f in fields_param.split(',')]
     
     total_cities = len(MOROCCO_CITIES)
     start_idx = (page - 1) * limit
     end_idx = min(start_idx + limit, total_cities)
     
-    cities_list = []
+    # Slice list
+    cities_page = MOROCCO_CITIES[start_idx:end_idx]
     
-    for i in range(start_idx, end_idx):
-        city_info = MOROCCO_CITIES[i]
-        city_name = city_info['name']
-        
-        try:
-            # Get minimal data for list view
-            summary, _ = wikipedia_provider.get_city_summary(city_name)
-            image = image_fetcher.get_one_representative_image(city_name)
-            coordinates = coordinates_provider.get_coordinates(city_name, "Morocco")
-            
-            cities_list.append({
-                "id": city_name.lower().replace(' ', '-'),
-                "name": city_name,
-                "country": "Morocco",
-                "region": city_info.get('region'),
-                "summary": summary or f"{city_name}, Morocco",
-                "image": image,
-                "coordinates": coordinates,
-                "has_details": True
-            })
-            
-        except Exception as e:
-            logger.warning(f"Failed to load Moroccan city {city_name}: {e}")
-            cities_list.append({
-                "id": city_name.lower().replace(' ', '-'),
-                "name": city_name,
-                "country": "Morocco",
-                "region": city_info.get('region'),
-                "summary": f"{city_name}, Morocco",
-                "image": None,
-                "coordinates": None,
-                "has_details": False
-            })
+    # Fetch in parallel
+    cities_list = fetch_cities_parallel(cities_page, requested_fields)
     
     return jsonify({
         "success": True,
@@ -1946,6 +2007,7 @@ def get_morocco_cities():
 def get_morocco_city_details(city_name):
     """
     Get full details for a specific Moroccan city
+    Supports field filtering via ?fields=name,images,summary
     """
     # Check origin
     origin_check = check_origin()
@@ -1953,6 +2015,11 @@ def get_morocco_city_details(city_name):
         return origin_check
     
     city_name = unquote(city_name)
+    fields_param = request.args.get('fields', type=str)
+    
+    requested_fields = None
+    if fields_param:
+        requested_fields = [f.strip().lower() for f in fields_param.split(',')]
     
     # Find city in MOROCCO_CITIES
     city_info = None
@@ -1968,40 +2035,55 @@ def get_morocco_city_details(city_name):
         }), 404
     
     try:
-        # Get detailed info
+        # Determine what to fetch based on requested fields
+        fetch_all = requested_fields is None or len(requested_fields) == 0
+        
+        should_fetch_summary = fetch_all or 'summary' in requested_fields or 'wiki_title' in requested_fields
+        should_fetch_coords = fetch_all or 'coordinates' in requested_fields or 'location' in requested_fields
+        should_fetch_images = fetch_all or 'images' in requested_fields
+        should_fetch_landmarks = fetch_all or 'landmarks' in requested_fields
+        
+        result_data = {
+            "name": city_name,
+            "country": "Morocco",
+            "region": city_info.get('region'),
+            "fetched_at": datetime.utcnow().isoformat()
+        }
+        
         search_name = f"{city_name}, Morocco"
-        summary, wiki_title = wikipedia_provider.get_city_summary(search_name)
-        if not summary:
-            summary, wiki_title = wikipedia_provider.get_city_summary(city_name)
+        
+        # Get detailed info
+        if should_fetch_summary:
+            summary, wiki_title = wikipedia_provider.get_city_summary(search_name)
+            if not summary:
+                summary, wiki_title = wikipedia_provider.get_city_summary(city_name)
+            result_data["summary"] = summary or f"Information about {city_name}, Morocco"
+            result_data["wiki_title"] = wiki_title
         
         # Get coordinates
-        coordinates = coordinates_provider.get_coordinates(city_name, "Morocco")
+        if should_fetch_coords:
+            coordinates = coordinates_provider.get_coordinates(city_name, "Morocco")
+            result_data["coordinates"] = coordinates
         
         # Get multiple images for the city
-        city_images = image_fetcher.get_images_for_city(search_name, limit=20)
-        if not city_images:
-            city_images = image_fetcher.get_images_for_city(city_name, limit=20)
+        if should_fetch_images:
+            city_images = image_fetcher.get_images_for_city(search_name, limit=20)
+            if not city_images:
+                city_images = image_fetcher.get_images_for_city(city_name, limit=20)
+            result_data["images"] = city_images
+            result_data["image_count"] = len(city_images)
         
         # Get landmarks with their own images
-        landmarks = wikipedia_provider.extract_landmarks(search_name)
-        if not landmarks:
-            landmarks = wikipedia_provider.extract_landmarks(city_name)
+        if should_fetch_landmarks:
+            landmarks = wikipedia_provider.extract_landmarks(search_name)
+            if not landmarks:
+                landmarks = wikipedia_provider.extract_landmarks(city_name)
+            result_data["landmarks"] = landmarks
+            result_data["landmark_count"] = len(landmarks)
         
         return jsonify({
             "success": True,
-            "data": {
-                "name": city_name,
-                "country": "Morocco",
-                "region": city_info.get('region'),
-                "wiki_title": wiki_title,
-                "summary": summary or f"Information about {city_name}, Morocco",
-                "coordinates": coordinates,
-                "images": city_images,
-                "image_count": len(city_images),
-                "landmarks": landmarks,
-                "landmark_count": len(landmarks),
-                "fetched_at": datetime.utcnow().isoformat()
-            }
+            "data": result_data
         })
         
     except Exception as e:
@@ -2023,6 +2105,11 @@ def search_cities():
     
     query = request.args.get('q', '').strip()
     limit = request.args.get('limit', 20, type=int)
+    fields_param = request.args.get('fields', type=str)
+    
+    requested_fields = None
+    if fields_param:
+        requested_fields = [f.strip().lower() for f in fields_param.split(',')]
     
     if len(query) < 2:
         return jsonify({
@@ -2030,34 +2117,14 @@ def search_cities():
             "error": "Search query must be at least 2 characters"
         }), 400
     
-    results = []
+    # Filter cities
+    filtered_cities = [city for city in WORLD_CITIES if query.lower() in city['name'].lower()]
     
-    for city in WORLD_CITIES:
-        if query.lower() in city['name'].lower():
-            city_name = city['name']
-            
-            try:
-                # Get minimal data for search results
-                summary, _ = wikipedia_provider.get_city_summary(city_name)
-                image = image_fetcher.get_one_representative_image(city_name)
-                coordinates = coordinates_provider.get_coordinates(city_name, city.get('country'))
-                
-                results.append({
-                    "id": city_name.lower().replace(' ', '-'),
-                    "name": city_name,
-                    "country": city.get('country'),
-                    "region": city.get('region'),
-                    "summary": summary or f"{city_name}, {city.get('country', 'a city')}",
-                    "image": image,
-                    "coordinates": coordinates,
-                    "has_details": True
-                })
-                
-                if len(results) >= limit:
-                    break
-                    
-            except Exception:
-                pass
+    # Limit results
+    filtered_cities = filtered_cities[:limit]
+    
+    # Fetch in parallel
+    results = fetch_cities_parallel(filtered_cities, requested_fields)
     
     return jsonify({
         "success": True,
