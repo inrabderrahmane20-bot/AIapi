@@ -53,7 +53,7 @@ class Config:
     IMAGE_CACHE_DIR: str = os.getenv("IMAGE_CACHE_DIR", "/tmp/image_cache")
     
     PRELOAD_TOP_CITIES: int = int(os.getenv("PRELOAD_TOP_CITIES", "8"))
-    BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "20"))
+    BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", "100"))
     LAZY_LOADING: bool = os.getenv("LAZY_LOADING", "true").lower() == "true"
     
     MAX_WIKIMEDIA_FILES_TO_SCAN: int = 80
