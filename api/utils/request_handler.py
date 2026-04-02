@@ -39,7 +39,8 @@ class SmartRequestHandler:
             raise
     
     def get_json_cached(self, url: str, params: dict = None, headers: dict = None, 
-                        cache_key: str = None, ttl: int = None, refresh: bool = False) -> Any:
+                        cache_key: str = None, ttl: int = None, refresh: bool = False,
+                        timeout: int = None) -> Any:
         if not cache_key:
             cache_key = hashlib.md5(
                 f"{url}{json.dumps(params or {}, sort_keys=True)}".encode()
@@ -53,7 +54,7 @@ class SmartRequestHandler:
                 return cached
         
         try:
-            response = self.get_with_retry(url, params, headers)
+            response = self.get_with_retry(url, params, headers, timeout=timeout or config.REQUEST_TIMEOUT)
             data = response.json()
             
             cache.set(cache_key, data, ttl or config.CACHE_TTL)

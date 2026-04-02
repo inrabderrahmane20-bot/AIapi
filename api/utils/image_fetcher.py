@@ -84,7 +84,8 @@ class IntelligentImageFetcher:
                 params=params,
                 cache_key=f"wikimedia:{search_query}",
                 ttl=config.CACHE_TTL_IMAGES,
-                refresh=refresh
+                refresh=refresh,
+                timeout=min(config.REQUEST_TIMEOUT, 5)
             )
             
             if not data or 'query' not in data:

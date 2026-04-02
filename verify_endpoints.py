@@ -23,6 +23,13 @@ def test_cities_endpoint():
             print(f"📊 Received {len(cities)} cities (Batch Size Check: Expected 100)")
             print(f"📊 Total cities available: {total}")
             print(f"📊 Has more: {has_more}")
+
+            coords_present = 0
+            for c in cities:
+                coords = c.get("coordinates")
+                if coords and coords.get("lat") is not None and coords.get("lon") is not None:
+                    coords_present += 1
+            print(f"📍 Coordinates present: {coords_present}/{len(cities)}")
             
             if len(cities) == 100:
                 print("✅ Batch size verified as 100")
@@ -49,61 +56,71 @@ def test_cities_endpoint():
         print(f"❌ Error: {e}")
 
 def test_single_city_refresh():
-    print("\n--- Testing /api/cities/<city_name> (Refresh Logic) ---")
-    # Test a smaller city to ensure landmarks/images work for less famous places too
-    cities_to_test = ["Rabat", "Al Hoceima"]
-    
-    for city_name in cities_to_test:
-        print(f"\nTesting City: {city_name}")
-        try:
-            # First call (Normal)
-            print(f"Fetching {city_name}...")
+    print("\n--- Testing /api/cities/<city_name> (Worldwide Sample + Refresh Budget) ---")
+    try:
+        non_morocco = []
+        page = 1
+        while len(non_morocco) < 25 and page <= 8:
+            r = requests.get(f"{BASE_URL}/api/cities?page={page}", headers=HEADERS)
+            if r.status_code != 200:
+                print(f"❌ Failed to fetch /api/cities?page={page}: {r.status_code}")
+                return
+            data = r.json()
+            cities = data.get("data", [])
+            for c in cities:
+                if c.get("country") == "Morocco":
+                    continue
+                if not c.get("name"):
+                    continue
+                non_morocco.append(c)
+            page += 1
+
+        if not non_morocco:
+            print("❌ Could not find non-Morocco cities in first pages")
+            return
+
+        sample = []
+        step = max(1, len(non_morocco) // 20)
+        for i in range(0, len(non_morocco), step):
+            sample.append(non_morocco[i].get("name"))
+            if len(sample) >= 20:
+                break
+        sample = [s for s in sample if s]
+
+        print(f"🌍 Sample (non-Morocco, {len(sample)} cities): {', '.join(sample)}")
+
+        refresh_indices = {0, len(sample)//2, len(sample)-1}
+
+        for idx, city_name in enumerate(sample):
+            print(f"\nCity: {city_name}")
+
+            t0 = time.time()
             r1 = requests.get(f"{BASE_URL}/api/cities/{city_name}", headers=HEADERS)
-            if r1.status_code == 200:
-                d1 = r1.json()
-                data = d1.get('data', {})
-                gallery = data.get('gallery', [])
-                print(f"✅ First fetch success. Gallery Size: {len(gallery)}")
-                
-                # Second call (Simulating refresh)
-                print(f"Fetching {city_name} again with refresh=true...")
-                start_time = time.time()
-                r2 = requests.get(f"{BASE_URL}/api/cities/{city_name}?refresh=true", headers=HEADERS)
-                elapsed = time.time() - start_time
-                
-                if r2.status_code == 200:
-                    d2 = r2.json()
-                    data2 = d2.get('data', {})
-                    gallery2 = data2.get('gallery', [])
-                    print(f"✅ Second fetch success ({elapsed:.2f}s). Gallery Size: {len(gallery2)}")
-                    print(f"   Details Loaded: {data2.get('details_loaded')}")
-                    if data2.get('details_loaded') is None:
-                        print(f"   Response Keys: {list(data2.keys())}")
-                    if data2.get('error'):
-                        print(f"   Error: {data2.get('error')}")
-                    
-                    # Check landmarks
-                    landmarks = data2.get('landmarks', [])
-                    print(f"✅ Landmarks found: {len(landmarks)}")
-                    for l in landmarks:
-                        img_status = "📸" if l.get('image') else "⚪"
-                        print(f"   - {img_status} {l['name']}")
-                        
-                    # Check main image
-                    main_image = data2.get('image', {})
-                    if main_image:
-                        print(f"✅ Main Image: {main_image.get('title')}")
-                        print(f"   Size: {main_image.get('width')}x{main_image.get('height')}")
-                        print(f"   URL: {main_image.get('url')}")
-                    else:
-                        print("❌ No main image found")
-                else:
-                    print(f"❌ Second fetch failed: {r2.status_code}")
-            else:
+            t1 = time.time() - t0
+            if r1.status_code != 200:
                 print(f"❌ First fetch failed: {r1.status_code}")
-            
-        except Exception as e:
-            print(f"❌ Error: {e}")
+                continue
+
+            d1 = r1.json().get("data", {})
+            coords = d1.get("coordinates")
+            print(f"✅ Normal fetch: {t1:.2f}s | coords={'yes' if coords else 'no'} | landmarks={len(d1.get('landmarks', []))} | gallery={len(d1.get('gallery', []))}")
+
+            if idx in refresh_indices:
+                t0 = time.time()
+                r2 = requests.get(f"{BASE_URL}/api/cities/{city_name}?refresh=true", headers=HEADERS)
+                t2 = time.time() - t0
+                if r2.status_code != 200:
+                    print(f"❌ Refresh fetch failed: {r2.status_code}")
+                    continue
+                d2 = r2.json().get("data", {})
+                coords2 = d2.get("coordinates")
+                print(f"✅ Refresh fetch: {t2:.2f}s | coords={'yes' if coords2 else 'no'} | landmarks={len(d2.get('landmarks', []))} | gallery={len(d2.get('gallery', []))}")
+
+                main_image = d2.get("image") or {}
+                if main_image:
+                    print(f"🖼️  Main image: {main_image.get('title')} ({main_image.get('width')}x{main_image.get('height')})")
+    except Exception as e:
+        print(f"❌ Error: {e}")
 
 if __name__ == "__main__":
     test_cities_endpoint()

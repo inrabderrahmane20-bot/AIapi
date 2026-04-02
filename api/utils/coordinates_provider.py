@@ -15,6 +15,85 @@ class CoordinatesProvider:
             timeout=config.GEOLOCATOR_TIMEOUT
         )
     
+    def get_coordinates_batch(self, cities: list, refresh: bool = False) -> Dict[str, Dict]:
+        """
+        Batch fetch coordinates for up to 50 cities using Wikipedia API to minimize external calls.
+        Returns a mapping: { city_name: {lat, lon} }
+        """
+        if not cities:
+            return {}
+        
+        from api.utils.request_handler import request_handler
+        
+        # Prepare titles with country disambiguation
+        title_to_city = {}
+        titles = []
+        for c in cities:
+            name = c.get('name')
+            country = c.get('country')
+            if not name:
+                continue
+            if country:
+                t1 = f"{name}, {country}"
+                t2 = f"{name} ({country})"
+                titles.extend([t1, t2])
+                title_to_city[t1] = name
+                title_to_city[t2] = name
+            titles.append(name)
+            title_to_city[name] = name
+        
+        # Wikipedia allows up to ~50 titles per request; chunk if necessary
+        def chunks(lst, n):
+            for i in range(0, len(lst), n):
+                yield lst[i:i+n]
+        
+        results = {}
+        for batch in chunks(titles, 50):
+            params = {
+                "action": "query",
+                "prop": "coordinates",
+                "titles": "|".join(batch),
+                "format": "json",
+                "redirects": 1
+            }
+            try:
+                data = request_handler.get_json_cached(
+                    "https://en.wikipedia.org/w/api.php",
+                    params=params,
+                    cache_key=f"wiki_batch_coords:{hash('|'.join(batch))}",
+                    ttl=config.CACHE_TTL_COORDS,
+                    refresh=refresh
+                )
+                q = data.get("query", {}) if data else {}
+                pages = q.get("pages", {})
+
+                # Build a resolver from normalized/redirects 'to' -> original city
+                resolved_to_city = {}
+                for norm in q.get("normalized", []) or []:
+                    src = norm.get("from")
+                    dst = norm.get("to")
+                    if src in title_to_city and dst:
+                        resolved_to_city[dst] = title_to_city[src]
+                for red in q.get("redirects", []) or []:
+                    src = red.get("from")
+                    dst = red.get("to")
+                    if src in title_to_city and dst:
+                        resolved_to_city[dst] = title_to_city[src]
+
+                for page in pages.values():
+                    title = page.get("title")
+                    coords_list = page.get("coordinates") or []
+                    if title and coords_list:
+                        coords = coords_list[0]
+                        city = title_to_city.get(title) or resolved_to_city.get(title)
+                        if city and city not in results:
+                            results[city] = {"lat": coords.get("lat"), "lon": coords.get("lon")}
+            except Exception as e:
+                logger.debug(f"Batch Wikipedia coords fetch failed: {e}")
+                continue
+        
+        return results
+    
     def get_coordinates(self, city_name: str, country: str = None, refresh: bool = False) -> Optional[Dict]:
         cache_key = f"coords:{city_name}:{country}"
         
@@ -56,7 +135,7 @@ class CoordinatesProvider:
         # 2. Try Wikipedia (Reliable, often has coords)
         # We try this before Nominatim because it's less rate-limited and often more accurate for "City" entities
         try:
-            wiki_coords = wikipedia_provider.get_city_coordinates(city_name, refresh=refresh)
+            wiki_coords = wikipedia_provider.get_city_coordinates(city_name, country=country, refresh=refresh)
             if wiki_coords:
                 logger.info(f"Found coordinates for {city_name} via Wikipedia: {wiki_coords}")
                 cache.set(cache_key, wiki_coords, config.CACHE_TTL_COORDS)

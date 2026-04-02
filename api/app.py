@@ -8,6 +8,7 @@ from api.utils.logger import logger
 from api.utils.cache import cache
 from api.data.cities import WORLD_CITIES, INTERLEAVED_WORLD_CITIES, MOROCCO_CITIES, REGIONS
 from api.utils.city_data_manager import fetch_cities_parallel, fetch_city_details
+from api.utils.coordinates_provider import coordinates_provider
 import sys
 import inspect
 
@@ -65,10 +66,14 @@ def get_cities():
     country = request.args.get('country', type=str)
     fields_param = request.args.get('fields', type=str)
     refresh = request.args.get('refresh', 'false').lower() == 'true'
+    fast = request.args.get('fast', 'true').lower() == 'true'
     
     requested_fields = None
     if fields_param:
         requested_fields = [f.strip().lower() for f in fields_param.split(',')]
+    else:
+        # Default to extremely fast preview: summary + coordinates only
+        requested_fields = ['summary', 'coordinates']
     
     # Filter cities
     # If no filters, use interleaved list for better region distribution
@@ -87,9 +92,33 @@ def get_cities():
     
     # Slice the list for the current page
     cities_page = filtered_cities[start_idx:end_idx]
+
+    # Fast path: fill coordinates via a single Wikipedia batch request (then serve from cache)
+    if fast and not refresh and requested_fields and ('coordinates' in requested_fields or 'location' in requested_fields):
+        try:
+            missing = []
+            for c in cities_page:
+                ck = f"coords:{c.get('name')}:{c.get('country')}"
+                if cache.get(ck) is None:
+                    missing.append(c)
+            if missing:
+                coords_map = coordinates_provider.get_coordinates_batch(missing, refresh=False)
+                for c in missing:
+                    name = c.get('name')
+                    country = c.get('country')
+                    coords = coords_map.get(name)
+                    if coords and coords.get('lat') is not None and coords.get('lon') is not None:
+                        cache.set(f"coords:{name}:{country}", coords, config.CACHE_TTL_COORDS)
+        except Exception as e:
+            logger.debug(f"Batch coordinate prefill failed: {e}")
     
-    # Fetch data in parallel
-    cities_list = fetch_cities_parallel(cities_page, requested_fields, refresh=refresh)
+    # Fetch data in parallel (fast mode uses cache-only to avoid cold external calls)
+    cities_list = fetch_cities_parallel(
+        cities_page,
+        requested_fields,
+        refresh=refresh,
+        cache_only=fast
+    )
     
     return jsonify({
         "success": True,

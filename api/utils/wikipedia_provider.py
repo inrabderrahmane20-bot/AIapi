@@ -84,9 +84,9 @@ class WikipediaDataProvider:
             'Ali', 'Mansur', 'Hassan', 'Mohammed'
         }
 
-    def get_city_coordinates(self, city_name: str, refresh: bool = False) -> Optional[Dict]:
-        """Get coordinates from Wikipedia API"""
-        cache_key = f"wiki_coords:{city_name}"
+    def get_city_coordinates(self, city_name: str, country: str = None, refresh: bool = False) -> Optional[Dict]:
+        """Get coordinates from Wikipedia API (title-based, with country disambiguation)"""
+        cache_key = f"wiki_coords:{city_name}:{country}"
         
         if not refresh:
             cached = cache.get(cache_key)
@@ -94,27 +94,39 @@ class WikipediaDataProvider:
                 return cached
         
         try:
-            params = {
-                "action": "query",
-                "prop": "coordinates",
-                "titles": city_name,
-                "format": "json"
-            }
-            
-            # Use request_handler directly for consistent caching/user-agent
             from api.utils.request_handler import request_handler
-            data = request_handler.get_json_cached(
-                "https://en.wikipedia.org/w/api.php",
-                params=params,
-                cache_key=f"wiki_api_coords:{city_name}",
-                ttl=config.CACHE_TTL_COORDS,
-                refresh=refresh
-            )
-            
-            if data:
+
+            candidate_titles = []
+            if country:
+                candidate_titles.extend([
+                    f"{city_name}, {country}",
+                    f"{city_name} ({country})",
+                ])
+            candidate_titles.append(city_name)
+
+            for title in candidate_titles:
+                params = {
+                    "action": "query",
+                    "prop": "coordinates",
+                    "titles": title,
+                    "format": "json",
+                    "redirects": 1
+                }
+
+                data = request_handler.get_json_cached(
+                    "https://en.wikipedia.org/w/api.php",
+                    params=params,
+                    cache_key=f"wiki_api_coords:{title}",
+                    ttl=config.CACHE_TTL_COORDS,
+                    refresh=refresh
+                )
+
+                if not data:
+                    continue
+
                 pages = data.get("query", {}).get("pages", {})
                 for page in pages.values():
-                    if "coordinates" in page:
+                    if "coordinates" in page and page["coordinates"]:
                         coords = page["coordinates"][0]
                         result = {
                             "lat": coords["lat"],
@@ -138,35 +150,58 @@ class WikipediaDataProvider:
                 return cached.get('summary'), cached.get('title')
         
         try:
+            from api.utils.request_handler import request_handler
+
+            params = {
+                "action": "query",
+                "prop": "extracts",
+                "exintro": 1,
+                "explaintext": 1,
+                "titles": city_name,
+                "format": "json",
+                "redirects": 1
+            }
+
+            data = request_handler.get_json_cached(
+                "https://en.wikipedia.org/w/api.php",
+                params=params,
+                cache_key=f"wiki_extract:{city_name}",
+                ttl=config.CACHE_TTL,
+                refresh=refresh,
+                timeout=min(config.REQUEST_TIMEOUT, 5)
+            )
+
+            pages = data.get("query", {}).get("pages", {}) if data else {}
+            for page in pages.values():
+                extract = (page.get("extract") or "").strip()
+                title = page.get("title")
+                if extract:
+                    sentences = re.split(r'(?<=[.!?])\s+', extract)
+                    short_summary = " ".join([s.strip() for s in sentences if s.strip()][:3]).strip()
+                    if short_summary:
+                        cache.set(cache_key, {"summary": short_summary, "title": title or city_name}, config.CACHE_TTL)
+                        return short_summary, title or city_name
+
+        except Exception as e:
+            logger.debug(f"Wikipedia summary API failed for {city_name}: {e}")
+
+        try:
             page = self.wiki.page(city_name)
-            
+
             if page.exists():
                 summary = page.summary or ""
                 if summary:
-                    # Clean wikitext markup from summary if present
                     summary = re.sub(r"\[\[(?:[^|\]]*\|)?([^\]]+)\]\]", r"\1", summary)
                     summary = re.sub(r"'''|''", "", summary)
-                    
-                    # Get first 2-3 sentences max
+
                     sentences = re.split(r'(?<=[.!?])\s+', summary)
-                    short_summary = ""
-                    sentence_count = 0
-                    for sentence in sentences:
-                        if sentence.strip():
-                            short_summary += sentence.strip() + ' '
-                            sentence_count += 1
-                            if sentence_count >= 3:
-                                break
-                    
-                    short_summary = short_summary.strip()
+                    short_summary = " ".join([s.strip() for s in sentences if s.strip()][:3]).strip()
+
                     if short_summary:
-                        cache.set(cache_key, {
-                            'summary': short_summary,
-                            'title': page.title
-                        }, config.CACHE_TTL)
+                        cache.set(cache_key, {'summary': short_summary, 'title': page.title}, config.CACHE_TTL)
                         return short_summary, page.title
         except Exception as e:
-            logger.debug(f"Wikipedia summary failed for {city_name}: {e}")
+            logger.debug(f"Wikipedia summary fallback failed for {city_name}: {e}")
         
         return None, None
     
@@ -294,16 +329,16 @@ class WikipediaDataProvider:
                 # If we still have very few landmarks, try the summary as a last resort
                 if len(landmarks) < 3 and page.summary:
                     self._extract_from_summary(page.summary, city_name, landmarks, seen_landmarks, page_links)
+                
+                if len(landmarks) < 5:
+                    extra = self._fetch_category_landmarks(city_name, refresh=refresh, limit=12)
+                    for name in extra:
+                        self._add_landmark(name, name, city_name, landmarks, seen_landmarks, high_confidence=True)
             
             # Limit to top 10
             landmarks = landmarks[:10]
             
-            # Fetch images for them
-            for landmark in landmarks:
-                # Use the fetcher to get a nice image
-                img = image_fetcher.fetch_landmark_image(landmark['name'], refresh=refresh)
-                if img:
-                    landmark['image'] = img
+            # Skip landmark image fetching to keep response fast
             
             cache.set(cache_key, landmarks, config.CACHE_TTL)
             
@@ -311,6 +346,59 @@ class WikipediaDataProvider:
             logger.error(f"Landmarks extraction failed for {city_name}: {e}", exc_info=True)
         
         return landmarks
+    
+    def _fetch_category_landmarks(self, city_name: str, refresh: bool = False, limit: int = 12) -> List[str]:
+        from api.utils.request_handler import request_handler
+        candidates = []
+        categories = [
+            f"Category:Tourist attractions in {city_name}",
+            f"Category:Visitor attractions in {city_name}",
+            f"Category:Buildings and structures in {city_name}",
+            f"Category:Museums in {city_name}",
+            f"Category:Parks in {city_name}",
+            f"Category:Squares in {city_name}",
+            f"Category:Bridges in {city_name}",
+            f"Category:Temples in {city_name}",
+            f"Category:Churches in {city_name}",
+            f"Category:Mosques in {city_name}",
+            f"Category:Castles in {city_name}",
+            f"Category:Palaces in {city_name}",
+            f"Category:Fortresses in {city_name}"
+        ]
+        seen = set()
+        for cat in categories:
+            try:
+                params = {
+                    "action": "query",
+                    "list": "categorymembers",
+                    "cmtitle": cat,
+                    "cmnamespace": 0,
+                    "cmlimit": limit,
+                    "format": "json"
+                }
+                data = request_handler.get_json_cached(
+                    "https://en.wikipedia.org/w/api.php",
+                    params=params,
+                    cache_key=f"wiki_cat_members:{cat}",
+                    ttl=config.CACHE_TTL,
+                    refresh=refresh,
+                    timeout=min(config.REQUEST_TIMEOUT, 5)
+                )
+                cm = (data or {}).get("query", {}).get("categorymembers", [])
+                for m in cm:
+                    title = m.get("title")
+                    if not title:
+                        continue
+                    if title in seen:
+                        continue
+                    if self._is_valid_landmark_name(title, city_name, high_confidence=True):
+                        candidates.append(title)
+                        seen.add(title)
+                if len(candidates) >= limit:
+                    break
+            except Exception:
+                continue
+        return candidates
 
     def _add_landmark(self, name: str, context: str, city_name: str, landmarks: List, seen: Set, high_confidence=False):
         """Add a landmark if valid and new"""
@@ -363,8 +451,7 @@ class WikipediaDataProvider:
         if name in self.stopwords: 
             # logger.debug(f"Rejecting '{name}': in stopwords")
             return False
-        if name in self.generics: 
-            # logger.debug(f"Rejecting '{name}': in generics")
+        if name in self.generics and not high_confidence:
             return False
         
         # 2. Token-based checks
@@ -377,12 +464,12 @@ class WikipediaDataProvider:
             # logger.debug(f"Rejecting '{name}': starts with stopword '{first_word}'")
             return False
             
-        # Contains historical terms?
-        for part in parts:
-            clean_part = part.strip('.,')
-            if clean_part in self.historical_terms:
-                logger.debug(f"Rejecting '{name}': contains historical term '{clean_part}'")
-                return False
+        if not high_confidence:
+            for part in parts:
+                clean_part = part.strip('.,')
+                if clean_part in self.historical_terms:
+                    logger.debug(f"Rejecting '{name}': contains historical term '{clean_part}'")
+                    return False
                 
         # 3. Structure checks
         # Too long? Likely a sentence fragment
